@@ -8,7 +8,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # incremental color works better, but doesn't fully solve the problem
-increment_color = False
+increment_color = True
 
 # 10 random restarts doesn't seem to help
 random_restarts = 1
@@ -16,6 +16,8 @@ random_restarts = 1
 rescale = True
 
 pair_loss = False
+
+use_float32 = True
 
 rules = {}
 
@@ -32,10 +34,14 @@ angle = math.pi / 4.0
 line_len = 100.0
 
 xv, yv = numpy.meshgrid(numpy.arange(width), numpy.arange(height), indexing='ij')
-tensor_xv = tf.constant(xv, dtype=tf.float64)
-tensor_yv = tf.constant(yv, dtype=tf.float64)
+if use_float32:
+    tensor_xv = tf.constant(xv, dtype=tf.float32)
+    tensor_yv = tf.constant(yv, dtype=tf.float32)
+else:
+    tensor_xv = tf.constant(xv, dtype=tf.float64)
+    tensor_yv = tf.constant(yv, dtype=tf.float64)
 
-b_color = numpy.array([1.0, 1.0, 1.0])
+b_color = numpy.array([0.3, 0.3, 0.3])
 l_color = numpy.array([0.0, 1.0, 0.0])
 
 def draw_aapolygon(input, points, color):
@@ -163,7 +169,10 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
                     current_ilnesize = from_data[i]
             else:
                 current_linesize = linesize
-            current_angle = tf.cast(current_angle, tf.float64)
+            if use_float32:
+                current_angle = tf.cast(current_angle, tf.float32)
+            else:
+                current_angle = tf.cast(current_angle, tf.float64)
             new_pos = polar_to_cart(current_angle, line_len, current_pos)
             ang1 = current_angle+math.pi/2.0
             ang2 = current_angle-math.pi/2.0
@@ -237,7 +246,10 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
                     loss += current_loss
                 else:
                     img = draw_aapolygon(img, stored_points[i], b_color)
-        return img, tf.cast(loss, tf.float32)
+        if use_float32:
+            return img, loss
+        else:
+            return img, tf.cast(loss, tf.float32)
     else:
         return img
     
@@ -245,8 +257,12 @@ tree = build(iterations, axiom)
 
 def coarse_to_fine_loss(output, ground, nlevels):
     diff = tf.expand_dims(output - ground, axis=0)
-    loss = tf.cast(tf.reduce_mean(diff ** 2.0), tf.float32)
-    node = tf.cast(diff, tf.float32)
+    loss = tf.reduce_mean(diff ** 2.0)
+    if not use_float32:
+        loss = tf.cast(loss, tf.float32)
+        node = tf.cast(diff, tf.float32)
+    else:
+        node = diff
     for n in range(nlevels):
         node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
         loss += tf.reduce_mean(node ** 2.0)
@@ -258,17 +274,25 @@ def constrain_width_positive(vars):
         if tree[i] == '1' or tree[i] == '0':
             #loss -= tf.sign(vars[i])
             loss += tf.nn.relu(-vars[i])
-    return tf.cast(loss, tf.float32)
+    if use_float32:
+        return loss
+    else:
+        return tf.cast(loss, tf.float32)
 
 def test1():
     assert pair_loss is False
     sess = tf.Session()
-    blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+    if use_float32:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float32)
+        tree_width = tf.Variable(tf.random_uniform([], dtype=tf.float32))
+        tree_angle = tf.Variable(tf.random_uniform([], dtype=tf.float32))
+    else:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+        tree_width = tf.Variable(tf.random_uniform([], dtype=tf.float64))
+        tree_angle = tf.Variable(tf.random_uniform([], dtype=tf.float64))
     ground_img = render(blank_img, tree, startpos)
     ground_arr = sess.run(ground_img)
     skimage.io.imsave('test1_ground.png', ground_arr)
-    tree_width = tf.Variable(tf.random_uniform([], dtype=tf.float64))
-    tree_angle = tf.Variable(tf.random_uniform([], dtype=tf.float64))
     output = render(blank_img, tree, startpos, 40.0 * tree_width, tree_angle)
     #loss = tf.reduce_mean((output - ground_img) ** 2)
     loss = coarse_to_fine_loss(output, ground_img, 9)
@@ -289,13 +313,17 @@ def test1():
 def test2():
     assert pair_loss is False
     sess = tf.Session()
-    blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+    if use_float32:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float32)
+        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float32))
+    else:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
     ground_img = render(blank_img, tree, startpos, rand=True)
-    ground_arr = sess.run(ground_img)
-    skimage.io.imsave('tf_test2_ground.png', numpy.clip(ground_arr, 0.0, 1.0))
-    tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
+    ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
+    skimage.io.imsave('tf_test2_ground.png', ground_arr)
     output = render(blank_img, tree, startpos, from_data=tree_var)
-    loss = coarse_to_fine_loss(output, ground_img, 9)
+    loss = coarse_to_fine_loss(output, ground_arr, 9)
     #loss -= 0.0001 * tf.cast(tf.reduce_sum(tree_var), tf.float32)
     constrain = constrain_width_positive(tree_var)
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
@@ -307,7 +335,7 @@ def test2():
     best_loss = 1e8
     best_output = None
     for _ in range(random_restarts):
-        for i in range(1000):
+        for i in range(2000):
             _, v_var, v_loss = sess.run([step, tree_var, loss])
             print(v_loss, v_var)
             if v_loss < best_loss:

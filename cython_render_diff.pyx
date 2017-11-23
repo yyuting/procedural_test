@@ -9,7 +9,8 @@ cimport cython.parallel
 @cython.cdivision(True)
 cpdef void draw_aapolygon(np.ndarray[np.float64_t, ndim=3] img,
                           np.ndarray[np.float64_t, ndim=2] points,
-                          np.ndarray[np.float64_t, ndim=1] color):
+                          np.ndarray[np.float64_t, ndim=1] color,
+                          int c_inc=0):
                           
     cdef int bbox_xmax = int(ceil(np.max(points[:, 0])))
     cdef int bbox_xmin = int(floor(np.min(points[:, 0])))
@@ -67,13 +68,27 @@ cpdef void draw_aapolygon(np.ndarray[np.float64_t, ndim=3] img,
             min_dist = get_min_dist(points, lines, x, y)
             if min_dist >= 0:
                 for c in range(3):
-                    img[xx, yy, c] += color[c]
+                    if c_inc > 0:
+                        img[xx, yy, c] += color[c]
+                    else:
+                        img[xx, yy, c] = color[c]
             elif min_dist > -1:
                 alpha = min_dist + 1
                 for c in range(3):
                     bg = img[xx, yy, c]
-                    #img[xx, yy, c] = alpha * color[c] + (1.0 - alpha) * bg
-                    img[xx, yy, c] += alpha * color[c]
+                    if c_inc > 0:
+                        img[xx, yy, c] += alpha * color[c]
+                    else:
+                        img[xx, yy, c] = alpha * color[c] + (1.0 - alpha) * bg
+    return
+    
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cpdef void draw_aapolygon_inc(np.ndarray[np.float64_t, ndim=3] img,
+                          np.ndarray[np.float64_t, ndim=2] points,
+                          np.ndarray[np.float64_t, ndim=1] color):
+    draw_aapolygon(img, points, color, 1)
     return
 
 @cython.boundscheck(False)
@@ -396,8 +411,6 @@ cpdef np.float64_t all_loss(np.ndarray[np.float64_t, ndim=3] diff,
             for cc in range(w):
                 r = scale * rr
                 c = scale * cc
-        #for r in range(0, diff_h, scale):
-        #    for c in range(0, diff_w, scale):
                 accum[0] = 0.0
                 accum[1] = 0.0
                 accum[2] = 0.0
@@ -406,9 +419,12 @@ cpdef np.float64_t all_loss(np.ndarray[np.float64_t, ndim=3] diff,
                         accum[0] += diff[r+xx, c+yy, 0]
                         accum[1] += diff[r+xx, c+yy, 1]
                         accum[2] += diff[r+xx, c+yy, 2]
+                accum[0] /= scale ** 2
+                accum[1] /= scale ** 2
+                accum[2] /= scale ** 2
                 current_loss += accum[0]**2 + accum[1]**2 + accum[2]**2
         # correct scale
-        loss += current_loss / (w * h * 3.0) ** 2
+        loss += current_loss / (w * h * 3.0)
     return loss
 
 @cython.boundscheck(False)

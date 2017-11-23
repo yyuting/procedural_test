@@ -13,8 +13,9 @@ rescale_half_pi = False
 random_restarts = 1
 
 draw_aapolygon = cython_render_diff.draw_aapolygon
-#b_color = numpy.array([0.3, 0.3, 0.3])
-b_color = numpy.array([1.0, 1.0, 1.0])
+b_color = numpy.array([0.3, 0.3, 0.3])
+draw_aapolygon = cython_render_diff.draw_aapolygon_inc
+#b_color = numpy.array([1.0, 1.0, 1.0])
 l_color = numpy.array([0.0, 1.0, 0.0])
 
 def draw_aapolygon_dummy(img, points, color):
@@ -258,7 +259,7 @@ def render_overlap_loss(img, grammar, pos, linesize=40, dev_angle=math.pi/4, ran
             elif from_data is not None:
                 if rescale:
                     if rescale_half_pi:
-                        current_dev_angle = from_data[i] * 0.5 * math.pi
+                        current_dev_angle = from_data[i] * dev_angle
                     else:
                         current_dev_angle = from_data[i] * dev_angle
                 else:
@@ -413,15 +414,23 @@ def coarse_to_fine_functor_cython(nlevels, ground_arr, f, overlap_loss=True, alp
     img = numpy.empty(size+(3,))
     def opt(x, multiple_loss=False):
         loss = f(img, x)
-        diff = ground_arr - img
+        diff = ground_arr - numpy.clip(img, 0.0, 1.0)
         if overlap_loss:
             if multiple_loss:
                 return alpha * loss, 1e4 * cython_render_diff.all_loss(diff, nlevels)
             else:
                 return alpha * loss + 1e4 * cython_render_diff.all_loss(diff, nlevels)
         else:
-            return 1e4 * cython_render_diff.all_loss(diff, nlevels)
+            return cython_render_diff.all_loss(diff, nlevels)
         #return cython_render_diff.all_loss(diff, nlevels)
+    return opt
+    
+def one_level_loss_functor(level, ground_arr, f):
+    img = numpy.empty(size+(3,))
+    def opt(x):
+        loss = f(img, x)
+        diff = ground_arr - numpy.clip(img, 0.0, 1.0)
+        return cython_render_diff.loss_level(diff, level)
     return opt
 
 def test1(method):
@@ -438,10 +447,11 @@ def test1(method):
     
 def test2(method, name=''):
     ground_arr = render(tree, startpos, rand=True)
-    skimage.io.imsave('py_test2_ground.png', numpy.clip(ground_arr, 0.0, 1.0))
+    skimage.io.imsave('py_test2_ground'+name+'.png', numpy.clip(ground_arr, 0.0, 1.0))
     def render_f(img, x):
         return render_prealloc(img, tree, startpos, from_data=x)
-    opt = coarse_to_fine_functor_cython(9, ground_arr, render_f)
+    ground_arr = numpy.clip(ground_arr, 0.0, 1.0)
+    opt = coarse_to_fine_functor_cython(9, ground_arr, render_f, overlap_loss=False)
     iter = [0]
     def opt_jac(x):
         loss = opt(x)
@@ -450,12 +460,16 @@ def test2(method, name=''):
         print("x:", x)
         print("loss:", loss)
         print("jac:", jac)
+        for ind in range(len(tree)):
+            print(tree[ind], x[ind], jac[ind])
         print()
         iter[0] += 1
+        if iter[0] % 50 == 0:
+            numpy.save('py_test2'+str(iter[0])+name+'.npy', x)
         return loss, jac
         
     start = numpy.random.rand(len(tree))
-    skimage.io.imsave('py_test2_start.png', numpy.clip(render(tree, startpos, from_data=start), 0.0, 1.0))
+    skimage.io.imsave('py_test2_start'+name+'.png', numpy.clip(render(tree, startpos, from_data=start), 0.0, 1.0))
     bounds = []
     for i in range(len(tree)):
         if tree[i] == '1' or tree[i] == '0':
@@ -479,7 +493,52 @@ def test2(method, name=''):
             best_ans = ans
     skimage.io.imsave('py_test2_out.png', numpy.clip(render(tree, startpos, from_data=x), 0.0, 1.0))
     print(best_ans)
+ 
+#test2('L-BFGS-B', 'loss_seperate_test')
+
+def test2_each_level(name=''):
+    ground_arr = render(tree, startpos, rand=True)
+    skimage.io.imsave('py_test2_ground'+name+'.png', numpy.clip(ground_arr, 0.0, 1.0))
+    def render_f(img, x):
+        return render_prealloc(img, tree, startpos, from_data=x)
+    ground_arr = numpy.clip(ground_arr, 0.0, 1.0)
+    start = numpy.random.rand(len(tree))
+    skimage.io.imsave('py_test2_start'+name+'.png', numpy.clip(render(tree, startpos, from_data=start), 0.0, 1.0))
+    bounds = []
+    for i in range(len(tree)):
+        if tree[i] == '1' or tree[i] == '0':
+            bounds.append((0.0, None))
+        else:
+            bounds.append((None, None))
+    for i in range(9, -1, -1):
+        opt = one_level_loss_functor(i, ground_arr, render_f)
+        iter = [0]
+        def opt_jac(x):
+            loss = opt(x)
+            jac = scipy.optimize.approx_fprime(x, opt, 1e-8)
+            print("iter:", iter[0])
+            print("x:", x)
+            print("loss:", loss)
+            print("jac:", jac)
+            for ind in range(len(tree)):
+                print(tree[ind], x[ind], jac[ind])
+            print()
+            iter[0] += 1
+            if iter[0] % 10 == 0:
+                numpy.save('py_test2'+str(i)+str(iter[0])+name+'.npy', x)
+            return loss, jac
+        
+        ans = scipy.optimize.minimize(opt_jac, start, method='L-BFGS-B', bounds=bounds, jac=True, options={'maxiter': 10})
+        start = ans['x']
+        numpy.save('py_test2_intermediate'+str(i)+name+'.npy', start)
+        skimage.io.imsave('py_test2_intermediate'+name+str(i)+'.png', numpy.clip(render(tree, startpos, from_data=start), 0.0, 1.0))
+    print("optimize finished")
+    print(ans)
+    skimage.io.imsave('py_test2_out'+name+'.png', numpy.clip(render(tree, startpos, from_data=ans['x']), 0.0, 1.0))
+    return
     
+#test2_each_level('seperate_loss')
+ 
 def test3():
     current_pos = (512, 512)
     for i in range(1):
