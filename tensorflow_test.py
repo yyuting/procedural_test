@@ -5,7 +5,7 @@ import numpy.random
 import time
 import sys
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # incremental color works better, but doesn't fully solve the problem
 increment_color = True
@@ -15,9 +15,16 @@ random_restarts = 1
 
 rescale = True
 
-pair_loss = False
+pair_loss = True
+
+if pair_loss:
+    increment_color = False
 
 use_float32 = True
+
+test_overlap = False
+
+seperate_minimizer = True
 
 rules = {}
 
@@ -41,7 +48,10 @@ else:
     tensor_xv = tf.constant(xv, dtype=tf.float64)
     tensor_yv = tf.constant(yv, dtype=tf.float64)
 
-b_color = numpy.array([0.3, 0.3, 0.3])
+if increment_color:
+    b_color = numpy.array([0.3, 0.3, 0.3])
+else:
+    b_color = numpy.array([1.0, 1.0, 1.0])
 l_color = numpy.array([0.0, 1.0, 0.0])
 
 def draw_aapolygon(input, points, color):
@@ -119,7 +129,7 @@ def draw_aapolygon_pair(input, points1, points2, color):
     out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
     out2 = tf.tile(1 - tf.expand_dims(alpha, axis=2), [1, 1, 3]) * input
     ans = out1 + out2
-    loss = 1e-8 * tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1))
+    loss = tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1))
     return ans, loss
 
 #sess = tf.Session()
@@ -196,6 +206,8 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
         elif var == '[' or var == ']':
             if rand:
                 current_dev_angle = dev_angle * (1.0 + numpy.random.rand() / 3.0)
+                if test_overlap and (i == 4 or i == 19):
+                    current_dev_angle /= 2.0
                 #current_dev_angle = dev_angle
             elif from_data is not None:
                 if rescale:
@@ -251,7 +263,7 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
         else:
             return img, tf.cast(loss, tf.float32)
     else:
-        return img
+        return img, 0
     
 tree = build(iterations, axiom)
 
@@ -267,6 +279,19 @@ def coarse_to_fine_loss(output, ground, nlevels):
         node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
         loss += tf.reduce_mean(node ** 2.0)
     return loss
+    
+def coarse_to_fine_loss_list(output, ground, nlevels):
+    diff = tf.expand_dims(output - ground, axis=0)
+    if not use_float32:
+        losses = [tf.cast(tf.reduce_mean(diff ** 2.0), tf.float32)]
+        node = tf.cast(diff, tf.float32)
+    else:
+        losses = [tf.reduce_mean(diff ** 2.0)]
+        node = diff
+    for n in range(nlevels):
+        node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
+        losses.append(tf.reduce_mean(node ** 2.0))
+    return losses[::-1]
     
 def constrain_width_positive(vars):
     loss = 0
@@ -290,10 +315,10 @@ def test1():
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_width = tf.Variable(tf.random_uniform([], dtype=tf.float64))
         tree_angle = tf.Variable(tf.random_uniform([], dtype=tf.float64))
-    ground_img = render(blank_img, tree, startpos)
+    ground_img, _ = render(blank_img, tree, startpos)
     ground_arr = sess.run(ground_img)
     skimage.io.imsave('test1_ground.png', ground_arr)
-    output = render(blank_img, tree, startpos, 40.0 * tree_width, tree_angle)
+    output, _ = render(blank_img, tree, startpos, 40.0 * tree_width, tree_angle)
     #loss = tf.reduce_mean((output - ground_img) ** 2)
     loss = coarse_to_fine_loss(output, ground_img, 9)
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
@@ -319,10 +344,10 @@ def test2():
     else:
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
-    ground_img = render(blank_img, tree, startpos, rand=True)
+    ground_img, _ = render(blank_img, tree, startpos, rand=True)
     ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
-    skimage.io.imsave('tf_test2_ground.png', ground_arr)
-    output = render(blank_img, tree, startpos, from_data=tree_var)
+    #skimage.io.imsave('tf_test2_ground.png', ground_arr)
+    output, _ = render(blank_img, tree, startpos, from_data=tree_var)
     loss = coarse_to_fine_loss(output, ground_arr, 9)
     #loss -= 0.0001 * tf.cast(tf.reduce_sum(tree_var), tf.float32)
     constrain = constrain_width_positive(tree_var)
@@ -331,7 +356,7 @@ def test2():
     step = minimizer.minimize(loss + constrain)
     sess.run(tf.global_variables_initializer())
     init_arr = sess.run(output)
-    skimage.io.imsave('tf_test2_start.png', numpy.clip(init_arr, 0.0, 1.0))
+    #skimage.io.imsave('tf_test2_start.png', numpy.clip(init_arr, 0.0, 1.0))
     best_loss = 1e8
     best_output = None
     for _ in range(random_restarts):
@@ -346,22 +371,27 @@ def test2():
     #output_arr = sess.run(output)
     skimage.io.imsave('tf_test2_output.png', numpy.clip(best_output, 0.0, 1.0))
 
-test2()
+#test2()
 #print(tree)
 
 def test3():
     assert pair_loss is True
+    overlap_scale = 1e-5
     sess = tf.Session()
-    blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+    if use_float32:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float32)
+        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float32))
+    else:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
     ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
-    ground_arr = sess.run(ground_img)
-    skimage.io.imsave('tf_test3_ground.png', numpy.clip(ground_arr, 0.0, 1.0))
-    tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
+    ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
+    skimage.io.imsave('tf_test3_ground.png', ground_arr)
     output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
-    loss = coarse_to_fine_loss(output, ground_img, 9)
+    loss = coarse_to_fine_loss(output, ground_arr, 9)
     constrain = constrain_width_positive(tree_var)
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
-    step = minimizer.minimize(loss + constrain + overlap_loss)
+    step = minimizer.minimize(loss + constrain + overlap_loss * overlap_scale)
     #optimizer = tf.contrib.opt.ScipyOptimizerInterface(1e4*(loss+overlap_loss+constrain), method='BFGS')
     #with tf.Session() as session:
     #    session.run(tf.global_variables_initializer())
@@ -373,7 +403,7 @@ def test3():
     best_loss = 1e8
     best_output = None
     for _ in range(random_restarts):
-        for i in range(1000):
+        for i in range(2000):
             _, v_var, v_loss, v_oloss = sess.run([step, tree_var, loss, overlap_loss])
             print(v_loss, v_oloss, v_var)
             if v_loss < best_loss:
@@ -385,6 +415,70 @@ def test3():
     
 #test3()
 
+def test4():
+    nlevels = 9
+    overlap_scale = 1e-5
+    sess = tf.Session()
+    if use_float32:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float32)
+        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float32))
+    else:
+        blank_img = tf.zeros(size+(3,), dtype=tf.float64)
+        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
+    ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
+    ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
+    skimage.io.imsave('tf_test4_ground.png', ground_arr)
+    output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
+    losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
+    constrain = constrain_width_positive(tree_var)
+    if pair_loss:
+        constrain += overlap_loss * overlap_scale
+    minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
+    steps = []
+    loss_all = 0
+    for loss in losses:
+        if seperate_minimizer:
+            steps.append(tf.train.AdamOptimizer(learning_rate=0.1).minimize(loss + constrain))
+        else:
+            steps.append(minimizer.minimize(loss + constrain))
+        loss_all += loss
+    sess.run(tf.global_variables_initializer())
+    init_arr = sess.run(output)
+    skimage.io.imsave('tf_test4_start.png', numpy.clip(init_arr, 0.0, 1.0))
+    best_loss = 1e8
+    best_output = None
+    best_var = None
+    iter_i = 20
+    iter_n = len(steps)
+    iter_k = 40
+    loss_record = numpy.empty((iter_i, iter_n, iter_k, 2))
+    for _ in range(random_restarts):
+        for i in range(iter_i):
+            print("i,", i)
+            for n in range(iter_n):
+                print("n,", n)
+                for k in range(iter_k):
+                    step = steps[n]
+                    loss = losses[n]
+                    _, v_var, v_loss, v_loss_all = sess.run([step, tree_var, loss, loss_all])
+                    print(v_loss, v_loss_all)
+                    loss_record[i, n, k, 0] = v_loss
+                    loss_record[i, n, k, 1] = v_loss_all
+                    if v_loss_all < best_loss:
+                        best_loss = v_loss_all
+                        best_var = v_var
+                        numpy.save('tf_test4.npy', v_var)
+        sess.run(tf.global_variables_initializer())
+    sess.run(tf.assign(tree_var, best_var))
+    if seperate_minimizer:
+        numpy.save('tf_test4_loss_record_pair_loss.npy', loss_record)
+    else:
+        numpy.save('tf_test4_loss_record.npy', loss_record)
+    best_output = sess.run(output)
+    skimage.io.imsave('tf_test4_output.png', numpy.clip(best_output, 0.0, 1.0))
+
+test4()
+    
 #blank_img = tf.zeros(size+(3,), dtype=tf.float64)
 #var = numpy.load('tf_test2.npy')
 #output = render(blank_img, tree, startpos, from_data=var)
