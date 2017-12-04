@@ -8,17 +8,23 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # incremental color works better, but doesn't fully solve the problem
-increment_color = True
+#increment_color = True
 
 # 10 random restarts doesn't seem to help
 random_restarts = 1
 
 rescale = True
 
-pair_loss = True
-
-if pair_loss:
+loss_type = 'triple'          # one of 'incremental', 'pair', 'triple'
+if loss_type == 'incremental':
+    increment_color = True
+else:
     increment_color = False
+
+#pair_loss = True
+
+#if pair_loss:
+#    increment_color = False
 
 use_float32 = True
 
@@ -54,7 +60,7 @@ else:
     b_color = numpy.array([1.0, 1.0, 1.0])
 l_color = numpy.array([0.0, 1.0, 0.0])
 
-def draw_aapolygon(input, points, color):
+def get_min_dist(points):
     lines = []
     for i in range(len(points)-1):
         x0 = points[i][0]
@@ -76,12 +82,22 @@ def draw_aapolygon(input, points, color):
         ux = points[line_ind][0] + k_clip * lines[line_ind][1] - tensor_xv
         uy = points[line_ind][1] + k_clip * lines[line_ind][2] - tensor_yv
         dist_to_line = lines[line_ind][1] * tensor_yv - lines[line_ind][2] * tensor_xv - lines[line_ind][0]
-        #dist_sign = tf.where(dist_to_line < 0, -tf.ones(tf.shape(dist_to_line), dtype=tf.float64), tf.ones(tf.shape(dist_to_line), dtype=tf.float64))
         dist_sign = tf.sign(dist_to_line)
-        #dense_dist.append(dist_sign * (ux ** 2 + uy ** 2) ** 0.5)
         dense_dist.append(dist_sign * (ux ** 2 + uy ** 2))
     dist_stack = tf.stack(dense_dist, axis=2)
     min_dist = tf.reduce_min(dist_stack, axis=2)
+    return min_dist
+    
+def draw_from_min_dist(input, color, min_dist):
+    alpha = tf.clip_by_value(min_dist+1, 0, 1)
+    out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
+    if increment_color:
+        return input + out1
+    out2 = tf.tile(1 - tf.expand_dims(alpha, axis=2), [1, 1, 3]) * input
+    return out1 + out2
+
+def draw_aapolygon(input, points, color):
+    min_dist = get_min_dist(points)
     alpha = tf.clip_by_value(min_dist+1, 0, 1)
     out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
     out2 = tf.tile(1 - tf.expand_dims(alpha, axis=2), [1, 1, 3]) * input
@@ -91,38 +107,18 @@ def draw_aapolygon(input, points, color):
         ans = out1 + out2
     return ans
     
+def loss_from_min_dist_triple(min_dist1, min_dist2, min_dist3):
+    return loss_from_min_dist_pair(min_dist1, min_dist2) + \
+           loss_from_min_dist_pair(min_dist1, min_dist3) + \
+           loss_from_min_dist_pair(min_dist2, min_dist3)
+    
+def loss_from_min_dist_pair(min_dist1, min_dist2):
+    overlap = tf.minimum(min_dist1, min_dist2)
+    loss = tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1))
+    return loss
+    
 def draw_aapolygon_pair(input, points1, points2, color):
-    lines1 = []
-    lines2 = []
-    dense_dist1 = []
-    dense_dist2 = []
-    min_dist_list = []
-    for points, lines, dense_dist in [(points1, lines1, dense_dist1), (points2, lines2, dense_dist2)]:
-        for i in range(len(points)-1):
-            x0 = points[i][0]
-            y0 = points[i][1]
-            x1 = points[i+1][0]
-            y1 = points[i+1][1]
-            dx = x1 - x0
-            dy = y1 - y0
-            dist = dx ** 2 + dy ** 2
-            line_b = dx * y0 - dy * x0
-            lines.append([line_b, dx, dy, dist])
-        
-        for line_ind in range(len(points)-1):
-            k = ((tensor_xv - points[line_ind][0]) * lines[line_ind][1] + \
-                 (tensor_yv - points[line_ind][1]) * lines[line_ind][2]) / \
-                lines[line_ind][3]
-            k_clip = tf.clip_by_value(k, 0, 1)
-            ux = points[line_ind][0] + k_clip * lines[line_ind][1] - tensor_xv
-            uy = points[line_ind][1] + k_clip * lines[line_ind][2] - tensor_yv
-            dist_to_line = lines[line_ind][1] * tensor_yv - lines[line_ind][2] * tensor_xv - lines[line_ind][0]
-            #dist_sign = tf.where(dist_to_line < 0, -tf.ones(tf.shape(dist_to_line), dtype=tf.float64), tf.ones(tf.shape(dist_to_line), dtype=tf.float64))
-            dist_sign = tf.sign(dist_to_line)
-            #dense_dist.append(dist_sign * (ux ** 2 + uy ** 2) ** 0.5)
-            dense_dist.append(dist_sign * (ux ** 2 + uy ** 2))
-        dist_stack = tf.stack(dense_dist, axis=2)
-        min_dist_list.append(tf.reduce_min(dist_stack, axis=2))
+    min_dist_list = [get_min_dist(points1), get_min_dist(points2)]
     min_dist = tf.maximum(min_dist_list[0], min_dist_list[1])
     overlap = tf.minimum(min_dist_list[0], min_dist_list[1])
     alpha = tf.clip_by_value(min_dist+1, 0, 1)
@@ -164,9 +160,9 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
     current_edge = None
     current_angle = math.pi
     stack = []
-    if pair_loss:
-        stored_points = [None]*len(grammar)
-        paired_idx = numpy.zeros(len(grammar), dtype=int)
+    loss = 0
+    stored_min_dist = [None]*len(grammar)
+    stored_left_idx = -numpy.ones(len(grammar)).astype('i')
     for i in range(len(grammar)):
         var = grammar[i]
         if var == '0' or var == '1':
@@ -197,10 +193,9 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
             p4 = polar_to_cart(ang2, current_linesize/2.0, new_pos)
             new_edge = [p3, p4]
             points = [p1, p2, p4, p3, p1]
-            if not pair_loss:
-                img = draw_aapolygon(img, points, b_color)
-            else:
-                stored_points[i] = points
+            min_dist = get_min_dist(points)
+            stored_min_dist[i] = min_dist
+            img = draw_from_min_dist(img, b_color, min_dist)
             current_pos = new_pos
             current_edge = new_edge
         elif var == '[' or var == ']':
@@ -228,7 +223,7 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
                 p1 = polar_to_cart(current_angle+math.pi/2.0, current_linesize/2.0, current_pos)
                 p2 = polar_to_cart(current_angle-math.pi/2.0, current_linesize/2.0, current_pos)
                 current_edge = [p1, p2]
-                if pair_loss:
+                if loss_type != 'incremental':
                     left_idx = idx
                     right_idx = i
                     for j in range(idx, len(grammar)):
@@ -241,29 +236,27 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
                         if new_var == '0' or new_var == '1':
                             right_idx = j
                             break
-                    paired_idx[left_idx] = right_idx
-                    paired_idx[right_idx] = -1
+                    stored_left_idx[right_idx] = left_idx
         else:
             raise
     
-    if pair_loss:
-        loss = 0
-        for i in range(len(grammar)):
-            var = grammar[i]
-            if var == '0' or var == '1':
-                if paired_idx[i] < 0:
-                    continue
-                elif paired_idx[i] > 0:
-                    img, current_loss = draw_aapolygon_pair(img, stored_points[i], stored_points[paired_idx[i]], b_color)
-                    loss += current_loss
-                else:
-                    img = draw_aapolygon(img, stored_points[i], b_color)
-        if use_float32:
-            return img, loss
-        else:
-            return img, tf.cast(loss, tf.float32)
-    else:
-        return img, 0
+    for right_idx in range(len(grammar)):
+        left_idx = stored_left_idx[right_idx]
+        if left_idx >= 0:
+            if loss_type == 'pair':
+                loss += loss_from_min_dist_pair(stored_min_dist[left_idx], stored_min_dist[right_idx])
+            else:
+                parent_idx = left_idx
+                for j in range(left_idx-1, -1, -1):
+                    new_var = grammar[j]
+                    if new_var == '1':
+                        parent_idx = j
+                        break
+                loss += loss_from_min_dist_triple(stored_min_dist[left_idx], stored_min_dist[right_idx], stored_min_dist[parent_idx])
+            
+    if not use_float32:
+        loss = tf.cast(loss, tf.float32)
+    return img, loss
     
 tree = build(iterations, axiom)
 
@@ -305,7 +298,7 @@ def constrain_width_positive(vars):
         return tf.cast(loss, tf.float32)
 
 def test1():
-    assert pair_loss is False
+    assert loss_type == 'incremental'
     sess = tf.Session()
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
@@ -336,7 +329,7 @@ def test1():
 #test1()
 
 def test2():
-    assert pair_loss is False
+    assert loss_type == 'incremental'
     sess = tf.Session()
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
@@ -375,7 +368,7 @@ def test2():
 #print(tree)
 
 def test3():
-    assert pair_loss is True
+    assert loss_type == 'incremental'
     overlap_scale = 1e-5
     sess = tf.Session()
     if use_float32:
@@ -417,7 +410,7 @@ def test3():
 
 def test4():
     nlevels = 9
-    overlap_scale = 1e-5
+    overlap_scale = 1e-6
     sess = tf.Session()
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
@@ -427,11 +420,11 @@ def test4():
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
     ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
     ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
-    skimage.io.imsave('tf_test4_ground.png', ground_arr)
+    skimage.io.imsave('tf_test4_ground_large_angle.png', ground_arr)
     output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
     losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
     constrain = constrain_width_positive(tree_var)
-    if pair_loss:
+    if loss_type != 'incremental':
         constrain += overlap_loss * overlap_scale
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
     steps = []
@@ -444,20 +437,20 @@ def test4():
         loss_all += loss
     sess.run(tf.global_variables_initializer())
     init_arr = sess.run(output)
-    skimage.io.imsave('tf_test4_start.png', numpy.clip(init_arr, 0.0, 1.0))
+    skimage.io.imsave('tf_test4_start_large_angle.png', numpy.clip(init_arr, 0.0, 1.0))
     best_loss = 1e8
     best_output = None
     best_var = None
-    iter_i = 20
+    iter_i = 5
     iter_n = len(steps)
-    iter_k = 40
-    loss_record = numpy.empty((iter_i, iter_n, iter_k, 2))
+    iter_k = 20
+    loss_record = numpy.empty((iter_i, iter_n, iter_k*iter_n, 2))
     for _ in range(random_restarts):
         for i in range(iter_i):
             print("i,", i)
             for n in range(iter_n):
                 print("n,", n)
-                for k in range(iter_k):
+                for k in range(iter_k*(n+1)):
                     step = steps[n]
                     loss = losses[n]
                     _, v_var, v_loss, v_loss_all = sess.run([step, tree_var, loss, loss_all])
@@ -471,11 +464,11 @@ def test4():
         sess.run(tf.global_variables_initializer())
     sess.run(tf.assign(tree_var, best_var))
     if seperate_minimizer:
-        numpy.save('tf_test4_loss_record_pair_loss.npy', loss_record)
+        numpy.save('tf_test4_loss_record_large_angle.npy', loss_record)
     else:
         numpy.save('tf_test4_loss_record.npy', loss_record)
     best_output = sess.run(output)
-    skimage.io.imsave('tf_test4_output.png', numpy.clip(best_output, 0.0, 1.0))
+    skimage.io.imsave('tf_test4_output_large_angle.png', numpy.clip(best_output, 0.0, 1.0))
 
 test4()
     
