@@ -5,6 +5,9 @@ import numpy.random
 import time
 import sys
 import os
+import random
+import string
+import argparse_util
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # incremental color works better, but doesn't fully solve the problem
@@ -30,7 +33,9 @@ use_float32 = True
 
 test_overlap = False
 
-seperate_minimizer = True
+seperate_minimizer = False
+
+large_angle = True
 
 rules = {}
 
@@ -200,7 +205,10 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
             current_edge = new_edge
         elif var == '[' or var == ']':
             if rand:
-                current_dev_angle = dev_angle * (1.0 + numpy.random.rand() / 3.0)
+                if large_angle:
+                    current_dev_angle = dev_angle * (1.0 + numpy.random.rand())
+                else:
+                    current_dev_angle = dev_angle * (1.0 + numpy.random.rand() / 3.0)
                 if test_overlap and (i == 4 or i == 19):
                     current_dev_angle /= 2.0
                 #current_dev_angle = dev_angle
@@ -408,7 +416,10 @@ def test3():
     
 #test3()
 
-def test4():
+def test4(prefix=''):
+    dir_name = 'var_data'+prefix
+    if not os.path.exists(dir_name):
+        os.mkdir(dir_name)
     nlevels = 9
     overlap_scale = 1e-6
     sess = tf.Session()
@@ -420,7 +431,7 @@ def test4():
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
     ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
     ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
-    skimage.io.imsave('tf_test4_ground_large_angle.png', ground_arr)
+    skimage.io.imsave(dir_name+'/tf_test4_ground.png', ground_arr)
     output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
     losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
     constrain = constrain_width_positive(tree_var)
@@ -428,49 +439,92 @@ def test4():
         constrain += overlap_loss * overlap_scale
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
     steps = []
+    gradients = []
     loss_all = 0
     for loss in losses:
         if seperate_minimizer:
-            steps.append(tf.train.AdamOptimizer(learning_rate=0.1).minimize(loss + constrain))
+            new_minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
         else:
-            steps.append(minimizer.minimize(loss + constrain))
+            new_minimizer = minimizer
+        gradient = new_minimizer.compute_gradients(loss + constrain)
+        gradients.append(gradient)
+        steps.append(new_minimizer.apply_gradients(gradient))
         loss_all += loss
     sess.run(tf.global_variables_initializer())
     init_arr = sess.run(output)
-    skimage.io.imsave('tf_test4_start_large_angle.png', numpy.clip(init_arr, 0.0, 1.0))
+    skimage.io.imsave(dir_name+'/tf_test4_start.png', numpy.clip(init_arr, 0.0, 1.0))
     best_loss = 1e8
     best_output = None
     best_var = None
-    iter_i = 5
+    v_var = None
+    iter_i = 1
     iter_n = len(steps)
-    iter_k = 20
+    iter_k = 10
     loss_record = numpy.empty((iter_i, iter_n, iter_k*iter_n, 2))
     for _ in range(random_restarts):
         for i in range(iter_i):
             print("i,", i)
             for n in range(iter_n):
                 print("n,", n)
-                for k in range(iter_k*(n+1)):
+                #for k in range(iter_k*(n+1)):
+                step = steps[n]
+                loss = losses[n]
+                gradient = gradients[n]
+                for k in range(iter_k*iter_n):
                     step = steps[n]
                     loss = losses[n]
-                    _, v_var, v_loss, v_loss_all = sess.run([step, tree_var, loss, loss_all])
+                    gradient = gradients[n]
+                    _, v_var, v_loss, v_loss_all, v_gradient = sess.run([step, tree_var, loss, loss_all, gradient])
+                    numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+'var.npy', v_var)
+                    numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+'gradient.npy', v_gradient)
                     print(v_loss, v_loss_all)
                     loss_record[i, n, k, 0] = v_loss
                     loss_record[i, n, k, 1] = v_loss_all
                     if v_loss_all < best_loss:
                         best_loss = v_loss_all
                         best_var = v_var
-                        numpy.save('tf_test4.npy', v_var)
+                        numpy.save(dir_name+'/tf_test4.npy', v_var)
         sess.run(tf.global_variables_initializer())
     sess.run(tf.assign(tree_var, best_var))
-    if seperate_minimizer:
-        numpy.save('tf_test4_loss_record_large_angle.npy', loss_record)
-    else:
-        numpy.save('tf_test4_loss_record.npy', loss_record)
+    numpy.save(dir_name+'/tf_test4_loss_record.npy', loss_record)
     best_output = sess.run(output)
-    skimage.io.imsave('tf_test4_output_large_angle.png', numpy.clip(best_output, 0.0, 1.0))
+    skimage.io.imsave(dir_name+'/tf_test4_output.png', numpy.clip(best_output, 0.0, 1.0))
 
-test4()
+def main():
+    parser = argparse_util.ArgumentParser(description='Toy procedural model problem.')
+    parser.add_argument('--random-restarts', dest='random_restarts', type=int, default=1, help='number of random restarts')
+    parser.add_argument('--GPU', dest='gpu', default='0', help='name of GPU to use')
+    parser.add_argument('--rescale', dest='rescale', type=bool, default=True, help='whether to rescale variables')
+    parser.add_argument('--loss-type', dest='loss_type', default='triple', help='loss used to optimize')
+    parser.add_argument('--use-float32', dest='use_float32', type=bool, default=True, help='whether to use float32 as dtype')
+    parser.add_argument('--test-overlap', dest='test_overlap', type=bool, default=False, help='whether to force the tree have overlap branches')
+    parser.add_argument('--seperate-minimizer', dest='seperate_minimizer', type=bool, default=False, help='whether to use seperate minimizer for different level of loss')
+    parser.add_argument('--large-angle', dest='large_angle', type=bool, default=False, help='whether to force the tree having large branch angle')
+    parser.add_argument('--prefix', dest='prefix', default='', help='unique prefix name to store data')
+    
+    args = parser.parse_args()
+    
+    global random_restarts, rescale, loss_type, increment_color, use_float32, test_overlap, seperate_minimizer, large_angle
+    random_restarts = args.random_restarts
+    rescale = args.rescale
+    loss_type = args.loss_type
+    if loss_type == 'incremental':
+        increment_color = True
+    else:
+        increment_color = False
+    use_float32 = args.use_float32
+    test_overlap = args.test_overlap
+    seperate_minimizer = args.seperate_minimizer
+    large_angle = args.large_angle
+    
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    
+    if args.prefix == '':
+        args.prefix = ''.join(random.choice(string.digits) for _ in range(5))
+    test4(args.prefix)
+    
+if __name__ == '__main__':
+    main()
     
 #blank_img = tf.zeros(size+(3,), dtype=tf.float64)
 #var = numpy.load('tf_test2.npy')
