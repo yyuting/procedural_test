@@ -416,10 +416,11 @@ def test3():
     
 #test3()
 
-def test4(prefix=''):
+def test4(prefix, info_str):
     dir_name = 'var_data'+prefix
     if not os.path.exists(dir_name):
         os.mkdir(dir_name)
+    open(os.path.join(dir_name, 'info.txt'), 'w+').write(info_str)
     nlevels = 9
     overlap_scale = 1e-6
     sess = tf.Session()
@@ -435,8 +436,8 @@ def test4(prefix=''):
     output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
     losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
     constrain = constrain_width_positive(tree_var)
-    if loss_type != 'incremental':
-        constrain += overlap_loss * overlap_scale
+    #if loss_type != 'incremental':
+        #constrain += overlap_loss * overlap_scale
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
     steps = []
     gradients = []
@@ -446,7 +447,10 @@ def test4(prefix=''):
             new_minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
         else:
             new_minimizer = minimizer
-        gradient = new_minimizer.compute_gradients(loss + constrain)
+        if loss_type != 'incremental':
+            gradient = new_minimizer.compute_gradients(loss + constrain + overlap_loss * overlap_scale)
+        else:
+            gradient = new_minimizer.compute_gradients(loss + constrain)
         gradients.append(gradient)
         steps.append(new_minimizer.apply_gradients(gradient))
         loss_all += loss
@@ -460,7 +464,7 @@ def test4(prefix=''):
     iter_i = 1
     iter_n = len(steps)
     iter_k = 10
-    loss_record = numpy.empty((iter_i, iter_n, iter_k*iter_n, 2))
+    loss_record = numpy.empty((iter_i, iter_n, iter_k*iter_n, iter_n+4))
     for _ in range(random_restarts):
         for i in range(iter_i):
             print("i,", i)
@@ -471,15 +475,25 @@ def test4(prefix=''):
                 loss = losses[n]
                 gradient = gradients[n]
                 for k in range(iter_k*iter_n):
-                    step = steps[n]
-                    loss = losses[n]
-                    gradient = gradients[n]
-                    _, v_var, v_loss, v_loss_all, v_gradient = sess.run([step, tree_var, loss, loss_all, gradient])
+                    #_, v_var, v_loss, v_loss_all, v_gradient = sess.run([step, tree_var, loss, loss_all, gradient])
+                    value_all = sess.run([step, tree_var, loss_all, overlap_loss, constrain, gradient] + losses)
+                    v_var = value_all[1]
+                    v_gradient = value_all[5]
                     numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+'var.npy', v_var)
                     numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+'gradient.npy', v_gradient)
+                    v_loss_all = value_all[2]
+                    v_overlap_loss = value_all[3]
+                    v_constrain = value_all[4]
+                    v_losses = value_all[6:]
+                    v_loss = v_losses[n]
                     print(v_loss, v_loss_all)
-                    loss_record[i, n, k, 0] = v_loss
-                    loss_record[i, n, k, 1] = v_loss_all
+                    loss_record[i, n, k, :iter_n] = v_losses
+                    loss_record[i, n, k, iter_n] = v_loss_all
+                    loss_record[i, n, k, iter_n+1] = v_overlap_loss
+                    loss_record[i, n, k, iter_n+2] = v_constrain
+                    loss_record[i, n, k, iter_n+3] = v_loss + v_constrain + v_overlap_loss * overlap_scale
+                    #loss_record[i, n, k, 0] = v_loss
+                    #loss_record[i, n, k, 1] = v_loss_all
                     if v_loss_all < best_loss:
                         best_loss = v_loss_all
                         best_var = v_var
@@ -494,34 +508,52 @@ def main():
     parser = argparse_util.ArgumentParser(description='Toy procedural model problem.')
     parser.add_argument('--random-restarts', dest='random_restarts', type=int, default=1, help='number of random restarts')
     parser.add_argument('--GPU', dest='gpu', default='0', help='name of GPU to use')
-    parser.add_argument('--rescale', dest='rescale', type=bool, default=True, help='whether to rescale variables')
+    parser.add_argument('--rescale', dest='rescale', action='store_true', help='rescale variables')
+    parser.add_argument('--no-rescale', dest='rescale', action='store_false', help='no rescale variables')
     parser.add_argument('--loss-type', dest='loss_type', default='triple', help='loss used to optimize')
-    parser.add_argument('--use-float32', dest='use_float32', type=bool, default=True, help='whether to use float32 as dtype')
-    parser.add_argument('--test-overlap', dest='test_overlap', type=bool, default=False, help='whether to force the tree have overlap branches')
-    parser.add_argument('--seperate-minimizer', dest='seperate_minimizer', type=bool, default=False, help='whether to use seperate minimizer for different level of loss')
-    parser.add_argument('--large-angle', dest='large_angle', type=bool, default=False, help='whether to force the tree having large branch angle')
+    parser.add_argument('--use-float32', dest='use_float32', action='store_true', help='use float32 as dtype')
+    parser.add_argument('--use-float64', dest='use_float32', action='store_false', help='use float64 as dtype')
+    parser.add_argument('--overlap', dest='test_overlap', action='store_true', help='force the tree have overlap branches')
+    parser.add_argument('--no-overlap', dest='test_overlap', action='store_false', help='do not force tree have overlap branches')
+    parser.add_argument('--seperate-minimizer', dest='seperate_minimizer', action='store_true', help='use seperate minimizer for different level of loss')
+    parser.add_argument('--single-minimizer', dest='seperate_minimizer', action='store_false', help='use single miimizer for different level of loss')
+    parser.add_argument('--large-angle', dest='large_angle', action='store_true', help='force the tree having large branch angle')
+    parser.add_argument('--no-large-angle', dest='large_angle', action='store_false', help='do not force the tree having large branch angle')
     parser.add_argument('--prefix', dest='prefix', default='', help='unique prefix name to store data')
+    
+    parser.set_defaults(rescale=True)
+    parser.set_defaults(use_float32=True)
+    parser.set_defaults(test_overlap=False)
+    parser.set_defaults(seperate_minimizer=True)
+    parser.set_defaults(large_angle=False)
     
     args = parser.parse_args()
     
-    global random_restarts, rescale, loss_type, increment_color, use_float32, test_overlap, seperate_minimizer, large_angle
+    global random_restarts
     random_restarts = args.random_restarts
+    global rescale
     rescale = args.rescale
+    global loss_type
+    global increment_color
     loss_type = args.loss_type
     if loss_type == 'incremental':
         increment_color = True
     else:
         increment_color = False
+    global use_float32
     use_float32 = args.use_float32
+    global test_overlap
     test_overlap = args.test_overlap
+    global seperate_minimizer
     seperate_minimizer = args.seperate_minimizer
+    global large_angle
     large_angle = args.large_angle
     
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     
     if args.prefix == '':
         args.prefix = ''.join(random.choice(string.digits) for _ in range(5))
-    test4(args.prefix)
+    test4(args.prefix, str(args))
     
 if __name__ == '__main__':
     main()
