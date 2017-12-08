@@ -8,7 +8,7 @@ import os
 import random
 import string
 import argparse_util
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 # incremental color works better, but doesn't fully solve the problem
 #increment_color = True
@@ -295,11 +295,12 @@ def coarse_to_fine_loss_list(output, ground, nlevels):
     return losses[::-1]
     
 def constrain_width_positive(vars):
+    constrain_scale = 100
     loss = 0
     for i in range(len(tree)):
         if tree[i] == '1' or tree[i] == '0':
             #loss -= tf.sign(vars[i])
-            loss += tf.nn.relu(-vars[i])
+            loss += constrain_scale * tf.nn.relu(1e-5-vars[i])
     if use_float32:
         return loss
     else:
@@ -416,11 +417,11 @@ def test3():
     
 #test3()
 
-def test4(prefix, info_str):
-    dir_name = 'var_data'+prefix
+def test4(args):
+    dir_name = 'var_data' + args.prefix
     if not os.path.exists(dir_name):
         os.mkdir(dir_name)
-    open(os.path.join(dir_name, 'info.txt'), 'w+').write(info_str)
+    open(os.path.join(dir_name, 'info.txt'), 'w+').write(str(args))
     nlevels = 9
     overlap_scale = 1e-6
     sess = tf.Session()
@@ -430,9 +431,12 @@ def test4(prefix, info_str):
     else:
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
-    ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
-    ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
-    skimage.io.imsave(dir_name+'/tf_test4_ground.png', ground_arr)
+    if args.ground == '':
+        ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
+        ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
+        skimage.io.imsave(dir_name+'/tf_test4_ground.png', ground_arr)
+    else:
+        ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join('train_ground_truth', args.ground)))
     output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
     losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
     constrain = constrain_width_positive(tree_var)
@@ -442,15 +446,22 @@ def test4(prefix, info_str):
     steps = []
     gradients = []
     loss_all = 0
+    lrate = 0.1
+    previous_loss = None
     for loss in losses:
         if seperate_minimizer:
-            new_minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
+            lrate *= args.change_lrate
+            new_minimizer = tf.train.AdamOptimizer(learning_rate=lrate)
         else:
             new_minimizer = minimizer
-        if loss_type != 'incremental':
-            gradient = new_minimizer.compute_gradients(loss + constrain + overlap_loss * overlap_scale)
+        if previous_loss is not None:
+            current_loss = loss + args.interpolate_loss * previous_loss
         else:
-            gradient = new_minimizer.compute_gradients(loss + constrain)
+            current_loss = loss
+        if loss_type != 'incremental':
+            gradient = new_minimizer.compute_gradients(current_loss + constrain + overlap_loss * overlap_scale)
+        else:
+            gradient = new_minimizer.compute_gradients(current_loss + constrain)
         gradients.append(gradient)
         steps.append(new_minimizer.apply_gradients(gradient))
         loss_all += loss
@@ -463,8 +474,8 @@ def test4(prefix, info_str):
     v_var = None
     iter_i = 1
     iter_n = len(steps)
-    iter_k = 10
-    loss_record = numpy.empty((iter_i, iter_n, iter_k*iter_n, iter_n+4))
+    iter_k = args.iter
+    loss_record = numpy.empty((iter_i, iter_n, iter_k, iter_n+4))
     for _ in range(random_restarts):
         for i in range(iter_i):
             print("i,", i)
@@ -474,7 +485,7 @@ def test4(prefix, info_str):
                 step = steps[n]
                 loss = losses[n]
                 gradient = gradients[n]
-                for k in range(iter_k*iter_n):
+                for k in range(iter_k):
                     #_, v_var, v_loss, v_loss_all, v_gradient = sess.run([step, tree_var, loss, loss_all, gradient])
                     value_all = sess.run([step, tree_var, loss_all, overlap_loss, constrain, gradient] + losses)
                     v_var = value_all[1]
@@ -520,6 +531,10 @@ def main():
     parser.add_argument('--large-angle', dest='large_angle', action='store_true', help='force the tree having large branch angle')
     parser.add_argument('--no-large-angle', dest='large_angle', action='store_false', help='do not force the tree having large branch angle')
     parser.add_argument('--prefix', dest='prefix', default='', help='unique prefix name to store data')
+    parser.add_argument('--ground', dest='ground', default='', help='use a deterministic ground truth image instead of random')
+    parser.add_argument('--change-lrate', dest='change_lrate', type=float, default=1.0, help='multiplier used to change learning rate for seperate minimizers')
+    parser.add_argument('--interpolate-loss', dest = 'interpolate_loss', type=float, default=0.0, help='interpolate between current level and previous level of loss')
+    parser.add_argument('--iter', dest='iter', type=int, default=100, help='number of iter per level of loss')
     
     parser.set_defaults(rescale=True)
     parser.set_defaults(use_float32=True)
@@ -553,7 +568,8 @@ def main():
     
     if args.prefix == '':
         args.prefix = ''.join(random.choice(string.digits) for _ in range(5))
-    test4(args.prefix, str(args))
+    #test4(args.prefix, args.ground, args.change_lrate, args.interpolate_loss, str(args))
+    test4(args)
     
 if __name__ == '__main__':
     main()

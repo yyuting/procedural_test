@@ -8,6 +8,7 @@ import inspect
 import skimage
 import tensorflow_test
 import tensorflow as tf
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 def plot_concat_loss():
     loss = numpy.load('tf_test4_loss_record_triple_loss2.npy')
@@ -37,6 +38,12 @@ def plot_loss_all(args):
             plot_each_level = True
         elif args[2] == 'all':
             plot_each_level = False
+    log_view = False
+    if len(args) > 3:
+        if args[3] == 'log':
+            log_view = True
+        elif args[3] == 'reg':
+            log_view = False
     filename = os.path.join(dir, 'tf_test4_loss_record.npy')
     loss = numpy.load(filename)
     loss_all_ind = loss.shape[1] if is_new_format else 1
@@ -47,7 +54,6 @@ def plot_loss_all(args):
     for k in inds:
         figure = pyplot.figure()
         loss_vec = loss[0, :, :, k].reshape(loss.shape[1]*loss.shape[2])
-        pyplot.plot(loss_vec)
         before_spike = numpy.empty((loss.shape[1], 2))
         after_spike = numpy.empty((loss.shape[1], 2))
         for i in range(loss.shape[1]):
@@ -59,18 +65,28 @@ def plot_loss_all(args):
             y_coord = loss_vec[x_coord]
             after_spike[i, 0] = x_coord
             after_spike[i, 1] = y_coord
-        pyplot.plot(before_spike[:, 0], before_spike[:, 1], 'bs')
-        pyplot.plot(after_spike[:, 0], after_spike[:, 1], 'g^')
+        if log_view:
+            pyplot.plot(numpy.log(loss_vec))
+            pyplot.plot(before_spike[:, 0], numpy.log(before_spike[:, 1]), 'bs')
+            pyplot.plot(after_spike[:, 0], numpy.log(after_spike[:, 1]), 'g^')
+        else:
+            pyplot.plot(loss_vec)
+            pyplot.plot(before_spike[:, 0], before_spike[:, 1], 'bs')
+            pyplot.plot(after_spike[:, 0], after_spike[:, 1], 'g^')
         if k < loss.shape[1]:
-            fig_name = os.path.join(dir, 'loss_level'+str(k)+'.png')
+            fig_name = os.path.join(dir, 'loss_level'+str(k)+('_log'if log_view else '')+'.png')
         elif k == loss.shape[1]:
-            fig_name = os.path.join(dir, 'loss_all_level.png')
+            fig_name = os.path.join(dir, 'loss_all_level'+('_log'if log_view else '')+'.png')
+            if not log_view:
+                pyplot.ylim(0.0, 0.6)
+            else:
+                pyplot.ylim(-10, 0)
         elif k == loss.shape[1]+1:
-            fig_name = os.path.join(dir, 'loss_overlap.png')
+            fig_name = os.path.join(dir, 'loss_overlap'+('_log'if log_view else '')+'.png')
         elif k == loss.shape[1]+2:
-            fig_name = os.path.join(dir, 'loss_constrain.png')
+            fig_name = os.path.join(dir, 'loss_constrain'+('_log'if log_view else '')+'.png')
         elif k == loss.shape[1]+3:
-            fig_name = os.path.join(dir, 'loss_train.png')
+            fig_name = os.path.join(dir, 'loss_train'+('_log'if log_view else '')+'.png')
         figure.savefig(fig_name)
         pyplot.close(figure)
     
@@ -135,6 +151,14 @@ def plot_all_gradient(args):
             fig_name = os.path.join(dir, 'gradient_norm.png')
         figure.savefig(fig_name)
         pyplot.close(figure)
+        
+def plot_everything(args):
+    dir = args[0]
+    plot_loss_all([dir, 'new', 'each', 'reg'])
+    plot_loss_all([dir, 'new', 'each', 'log'])
+    plot_spike_imgs([dir])
+    plot_all_gradient([dir, 'norm'])
+    plot_all_gradient([dir, 'each'])
      
 def main():
     func_name = sys.argv[1]
