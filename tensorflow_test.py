@@ -10,9 +10,7 @@ import string
 import argparse_util
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
-gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.99)
-
-ground_dir = 'train_ground_truth'
+gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.5)
 
 # incremental color works better, but doesn't fully solve the problem
 #increment_color = True
@@ -97,44 +95,6 @@ def get_min_dist(points):
     min_dist = tf.reduce_min(dist_stack, axis=2)
     return min_dist
     
-def get_min_dist_parallel(points, parallel_n):
-    lines = []
-    for i in range(len(points)-1):
-        x0 = points[i][0]
-        y0 = points[i][1]
-        x1 = points[i+1][0]
-        y1 = points[i+1][1]
-        dx = x1 - x0
-        dy = y1 - y0
-        dist = dx ** 2 + dy ** 2
-        line_b = dx * y0 - dy * x0
-        lines.append([line_b, dx, dy, dist])
-    
-    dense_dist = []
-    xv_tile = tf.tile(tf.expand_dims(tensor_xv, 2), [1, 1, parallel_n])
-    yv_tile = tf.tile(tf.expand_dims(tensor_yv, 2), [1, 1, parallel_n])
-    for line_ind in range(len(points)-1):
-        k = ((xv_tile - points[line_ind][0]) * lines[line_ind][1] + \
-             (yv_tile - points[line_ind][1]) * lines[line_ind][2]) / \
-            lines[line_ind][3]
-        k_clip = tf.clip_by_value(k, 0, 1)
-        ux = points[line_ind][0] + k_clip * lines[line_ind][1] - xv_tile
-        uy = points[line_ind][1] + k_clip * lines[line_ind][2] - yv_tile
-        dist_to_line = lines[line_ind][1] * yv_tile - lines[line_ind][2] * xv_tile - lines[line_ind][0]
-        dist_sign = tf.sign(dist_to_line)
-        dense_dist.append(dist_sign * (ux ** 2 + uy ** 2))
-    dist_stack = tf.stack(dense_dist, axis=3)
-    min_dist = tf.reduce_min(dist_stack, axis=3)
-    return min_dist
-    
-def draw_from_min_dist_parallel(input, color, min_dist):
-    alpha = tf.clip_by_value(min_dist+1, 0, 1)
-    out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
-    if increment_color:
-        return input + out1
-    out2 = tf.tile(1 - tf.expand_dims(alpha, axis=2), [1, 1, 3, 1]) * input
-    return out1 + out2
-    
 def draw_from_min_dist(input, color, min_dist):
     alpha = tf.clip_by_value(min_dist+1, 0, 1)
     out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
@@ -161,7 +121,6 @@ def loss_from_min_dist_triple(min_dist1, min_dist2, min_dist3):
     
 def loss_from_min_dist_pair(min_dist1, min_dist2):
     overlap = tf.minimum(min_dist1, min_dist2)
-    #loss = tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1), [0, 1])
     loss = tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1))
     return loss
     
@@ -321,125 +280,6 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
         loss = tf.cast(loss, tf.float32)
     return img, loss, out_of_canvas_loss
     
-def render_parallel(parallel_n, img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from_data=None, var_len=False):
-    current_pos = pos
-    current_edge = None
-    current_angle = math.pi
-    stack = []
-    loss = 0
-    stored_min_dist = [None]*len(grammar)
-    stored_left_idx = -numpy.ones(len(grammar)).astype('i')
-    linelen_ind = 0
-    out_of_canvas_loss = 0
-    for i in range(len(grammar)):
-        var = grammar[i]
-        if var == '0' or var == '1':
-            if rand:
-                current_linesize = linesize * (1.0 + numpy.random.randn(parallel_n) / 3.0)
-            elif from_data is not None:
-                if rescale:
-                    current_linesize = from_data[i] * linesize
-                else:
-                    current_linesize = from_data[i]
-            else:
-                current_linesize = linesize
-            if use_float32:
-                current_angle = tf.cast(current_angle, tf.float32)
-            else:
-                current_angle = tf.cast(current_angle, tf.float64)
-            if var_len and rand:
-                current_linelen = line_len * (1.0 + numpy.random.randn(parallel_n) / 3.0)
-            elif var_len and from_data is not None:
-                current_linelen = from_data[len(grammar)+linelen_ind]
-                linelen_ind += 1
-                if rescale:
-                    current_linelen *= line_len
-            else:
-                current_linelen = line_len
-            new_pos = polar_to_cart(current_angle, current_linelen, current_pos)
-            out_of_canvas_loss += 1000 * (tf.nn.relu(-new_pos[0]) + tf.nn.relu(-new_pos[1]) + tf.nn.relu(new_pos[0] - size[0]) + tf.nn.relu(new_pos[1] - size[1]))
-            ang1 = current_angle+math.pi/2.0
-            ang2 = current_angle-math.pi/2.0
-            if current_edge is None:
-                p1 = polar_to_cart(ang1, current_linesize/2.0, current_pos)
-                p2 = polar_to_cart(ang2, current_linesize/2.0, current_pos)
-                current_edge = [p1, p2]
-            else:
-                p1 = current_edge[0]
-                p2 = current_edge[1]
-            p3 = polar_to_cart(ang1, current_linesize/2.0, new_pos)
-            p4 = polar_to_cart(ang2, current_linesize/2.0, new_pos)
-            new_edge = [p3, p4]
-            points = [p1, p2, p4, p3, p1]
-            min_dist = get_min_dist_parallel(points, parallel_n)
-            stored_min_dist[i] = min_dist
-            img = draw_from_min_dist_parallel(img, b_color, min_dist)
-            current_pos = new_pos
-            current_edge = new_edge
-        elif var == '[' or var == ']':
-            if rand:
-                if large_angle:
-                    current_dev_angle = dev_angle * (1.0 + numpy.random.rand())
-                else:
-                    current_dev_angle = dev_angle * (1.0 + numpy.random.rand() / 3.0)
-                if test_overlap and (i == 4 or i == 19):
-                    current_dev_angle /= 2.0
-                #current_dev_angle = dev_angle
-            elif from_data is not None:
-                if rescale:
-                    current_dev_angle = from_data[i] * dev_angle
-                else:
-                    current_dev_angle = from_data[i]
-            else:
-                current_dev_angle = dev_angle
-            if var == '[':
-                stack.append((current_pos, current_angle, current_edge, current_linesize, i))
-                current_angle -= current_dev_angle
-                p1 = polar_to_cart(current_angle+math.pi/2.0, current_linesize/2.0, current_pos)
-                p2 = polar_to_cart(current_angle-math.pi/2.0, current_linesize/2.0, current_pos)
-                current_edge = [p1, p2]
-            else:
-                current_pos, current_angle, current_edge, current_linesize, idx = stack.pop()
-                current_angle += current_dev_angle
-                p1 = polar_to_cart(current_angle+math.pi/2.0, current_linesize/2.0, current_pos)
-                p2 = polar_to_cart(current_angle-math.pi/2.0, current_linesize/2.0, current_pos)
-                current_edge = [p1, p2]
-                if loss_type != 'incremental':
-                    left_idx = idx
-                    right_idx = i
-                    for j in range(idx, len(grammar)):
-                        new_var = grammar[j]
-                        if new_var == '0' or new_var == '1':
-                            left_idx = j
-                            break
-                    for j in range(i, len(grammar)):
-                        new_var = grammar[j]
-                        if new_var == '0' or new_var == '1':
-                            right_idx = j
-                            break
-                    stored_left_idx[right_idx] = left_idx
-        else:
-            raise
-    
-    for right_idx in range(len(grammar)):
-        left_idx = stored_left_idx[right_idx]
-        if left_idx >= 0:
-            if loss_type == 'pair':
-                loss += loss_from_min_dist_pair(stored_min_dist[left_idx], stored_min_dist[right_idx])
-            else:
-                parent_idx = left_idx
-                for j in range(left_idx-1, -1, -1):
-                    new_var = grammar[j]
-                    if new_var == '1':
-                        parent_idx = j
-                        break
-                loss += loss_from_min_dist_triple(stored_min_dist[left_idx], stored_min_dist[right_idx], stored_min_dist[parent_idx])
-            
-    if not use_float32:
-        loss = tf.cast(loss, tf.float32)
-    return img, loss, out_of_canvas_loss 
-                
-    
 tree = build(iterations, axiom)
 no_branch = 0
 for var in tree:
@@ -457,20 +297,6 @@ def coarse_to_fine_loss(output, ground, nlevels):
     for n in range(nlevels):
         node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
         loss += tf.reduce_mean(node ** 2.0)
-    return loss
-    
-def coarse_to_fine_loss_parallel(output, ground, nlevels):
-    diff = output - tf.expand_dims(ground.astype('f'), axis=3)
-    loss = tf.reduce_mean(diff ** 2.0, [0, 1, 2])
-    diff = tf.transpose(diff, [2, 0, 1, 3])
-    if not use_float32:
-        loss = tf.cast(loss, tf.float32)
-        node = tf.cast(diff, tf.float32)
-    else:
-        node = diff
-    for n in range(nlevels):
-        node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
-        loss += tf.reduce_mean(node ** 2.0, [0, 1, 2])
     return loss
     
 def coarse_to_fine_loss_list(output, ground, nlevels):
@@ -632,7 +458,7 @@ def test4(args):
         ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
         skimage.io.imsave(dir_name+'/tf_test4_ground.png', ground_arr)
     else:
-        ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join(ground_dir, args.ground)))
+        ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join('train_ground_truth', args.ground)))
     output, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
     if args.multi_loss:
         losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
@@ -762,53 +588,6 @@ def test4(args):
     best_output = sess.run(output)
     skimage.io.imsave(dir_name+'/tf_test4_output.png', numpy.clip(best_output, 0.0, 1.0))
 
-def test_parallel(args):
-    parallel_n = 2
-    if args.change_len:
-        var_size = len(tree) + no_branch
-    else:
-        var_size = len(tree)
-        
-    ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join(ground_dir, 'regular.png')))
-    
-    #sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
-    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
-    minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
-    
-    all_loss = []
-    gall = []
-    for i in range(parallel_n):
-        blank_img = tf.zeros(size+(3,), dtype=tf.float32)
-        tree_var = tf.Variable(tf.random_uniform([var_size], dtype=tf.float32))
-        output, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
-        loss = coarse_to_fine_loss(output, ground_arr, 9)
-        all_loss.append(loss)
-        gall.append(minimizer.compute_gradients(loss, var_list=tree_var))
-        
-    #gall = minimizer.compute_gradients(all_loss)
-    sess.run(tf.global_variables_initializer())
-    vgall = sess.run(gall)
-    print(vgall)
-    return
-    
-    blank_img = tf.zeros(size+(3,parallel_n), dtype=tf.float32)
-    tree_var = tf.Variable(tf.random_uniform([var_size, parallel_n], dtype=tf.float32))
-    
-    ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join(ground_dir, 'regular.png')))
-    output, overlap_loss, out_of_canvas_loss = render_parallel(parallel_n, blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
-    
-    loss = coarse_to_fine_loss_parallel(output, ground_arr, 9)
-    constrain = constrain_width_positive(tree_var, var_size)
-    
-    minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
-    
-    g1 = minimizer.compute_gradients(loss[0])
-    gall = minimizer.compute_gradients(tf.reduce_sum(loss))
-    sess.run(tf.global_variables_initializer())
-    vgall, vg1 = sess.run([gall, g1])
-    print(vg1)
-    print(vgall)
-    
 def main():
     parser = argparse_util.ArgumentParser(description='Toy procedural model problem.')
     parser.add_argument('--random-restarts', dest='random_restarts', type=int, default=1, help='number of random restarts')
@@ -839,7 +618,6 @@ def main():
     parser.add_argument('--beta1', dest='beta1', type=float, default=0.9, help='parameter beta1 for adam optimizer')
     parser.add_argument('--beta2', dest='beta2', type=float, default=0.99, help='parameter beta2 for adam optimizer')
     parser.add_argument('--learning-rate', dest='learning_rate', type=float, default=0.1, help='parameter learning rate for optimizer')
-    parser.add_argument('--test-parallel', dest='test_parallel', action='store_true', help='test parallel with multiple objectives')
     
     parser.set_defaults(rescale=True)
     parser.set_defaults(use_float32=True)
@@ -849,7 +627,6 @@ def main():
     parser.set_defaults(change_len=False)
     parser.set_defaults(multi_loss=True)
     parser.set_defaults(smooth=False)
-    parser.set_defaults(test_parallel=False)
     
     args = parser.parse_args()
     
@@ -878,10 +655,7 @@ def main():
     if args.prefix == '':
         args.prefix = ''.join(random.choice(string.digits) for _ in range(5))
     #test4(args.prefix, args.ground, args.change_lrate, args.interpolate_loss, str(args))
-    if args.test_parallel:
-        test_parallel(args)
-    else:
-        test4(args)
+    test4(args)
     
 if __name__ == '__main__':
     main()
