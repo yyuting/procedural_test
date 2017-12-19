@@ -8,7 +8,11 @@ import os
 import random
 import string
 import argparse_util
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.99)
+
+ground_dir = 'train_ground_truth'
 
 # incremental color works better, but doesn't fully solve the problem
 #increment_color = True
@@ -93,6 +97,44 @@ def get_min_dist(points):
     min_dist = tf.reduce_min(dist_stack, axis=2)
     return min_dist
     
+def get_min_dist_parallel(points, parallel_n):
+    lines = []
+    for i in range(len(points)-1):
+        x0 = points[i][0]
+        y0 = points[i][1]
+        x1 = points[i+1][0]
+        y1 = points[i+1][1]
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = dx ** 2 + dy ** 2
+        line_b = dx * y0 - dy * x0
+        lines.append([line_b, dx, dy, dist])
+    
+    dense_dist = []
+    xv_tile = tf.tile(tf.expand_dims(tensor_xv, 2), [1, 1, parallel_n])
+    yv_tile = tf.tile(tf.expand_dims(tensor_yv, 2), [1, 1, parallel_n])
+    for line_ind in range(len(points)-1):
+        k = ((xv_tile - points[line_ind][0]) * lines[line_ind][1] + \
+             (yv_tile - points[line_ind][1]) * lines[line_ind][2]) / \
+            lines[line_ind][3]
+        k_clip = tf.clip_by_value(k, 0, 1)
+        ux = points[line_ind][0] + k_clip * lines[line_ind][1] - xv_tile
+        uy = points[line_ind][1] + k_clip * lines[line_ind][2] - yv_tile
+        dist_to_line = lines[line_ind][1] * yv_tile - lines[line_ind][2] * xv_tile - lines[line_ind][0]
+        dist_sign = tf.sign(dist_to_line)
+        dense_dist.append(dist_sign * (ux ** 2 + uy ** 2))
+    dist_stack = tf.stack(dense_dist, axis=3)
+    min_dist = tf.reduce_min(dist_stack, axis=3)
+    return min_dist
+    
+def draw_from_min_dist_parallel(input, color, min_dist):
+    alpha = tf.clip_by_value(min_dist+1, 0, 1)
+    out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
+    if increment_color:
+        return input + out1
+    out2 = tf.tile(1 - tf.expand_dims(alpha, axis=2), [1, 1, 3, 1]) * input
+    return out1 + out2
+    
 def draw_from_min_dist(input, color, min_dist):
     alpha = tf.clip_by_value(min_dist+1, 0, 1)
     out1 = tf.stack([alpha * color[0], alpha * color[1], alpha * color[2]], axis=2)
@@ -119,6 +161,7 @@ def loss_from_min_dist_triple(min_dist1, min_dist2, min_dist3):
     
 def loss_from_min_dist_pair(min_dist1, min_dist2):
     overlap = tf.minimum(min_dist1, min_dist2)
+    #loss = tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1), [0, 1])
     loss = tf.reduce_sum(tf.clip_by_value(overlap+1, 0, 1))
     return loss
     
@@ -160,7 +203,7 @@ def polar_to_cart(theta, length, pos):
     y = length * tf.sin(theta)
     return [pos[0] + x, pos[1] + y]
     
-def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from_data=None):
+def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from_data=None, var_len=False):
     current_pos = pos
     current_edge = None
     current_angle = math.pi
@@ -168,6 +211,8 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
     loss = 0
     stored_min_dist = [None]*len(grammar)
     stored_left_idx = -numpy.ones(len(grammar)).astype('i')
+    linelen_ind = 0
+    out_of_canvas_loss = 0
     for i in range(len(grammar)):
         var = grammar[i]
         if var == '0' or var == '1':
@@ -177,14 +222,24 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
                 if rescale:
                     current_linesize = from_data[i] * linesize
                 else:
-                    current_ilnesize = from_data[i]
+                    current_linesize = from_data[i]
             else:
                 current_linesize = linesize
             if use_float32:
                 current_angle = tf.cast(current_angle, tf.float32)
             else:
                 current_angle = tf.cast(current_angle, tf.float64)
-            new_pos = polar_to_cart(current_angle, line_len, current_pos)
+            if var_len and rand:
+                current_linelen = line_len * (1.0 + numpy.random.randn() / 3.0)
+            elif var_len and from_data is not None:
+                current_linelen = from_data[len(grammar)+linelen_ind]
+                linelen_ind += 1
+                if rescale:
+                    current_linelen *= line_len
+            else:
+                current_linelen = line_len
+            new_pos = polar_to_cart(current_angle, current_linelen, current_pos)
+            out_of_canvas_loss += 1000 * (tf.nn.relu(-new_pos[0]) + tf.nn.relu(-new_pos[1]) + tf.nn.relu(new_pos[0] - size[0]) + tf.nn.relu(new_pos[1] - size[1]))
             ang1 = current_angle+math.pi/2.0
             ang2 = current_angle-math.pi/2.0
             if current_edge is None:
@@ -264,9 +319,132 @@ def render(img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from
             
     if not use_float32:
         loss = tf.cast(loss, tf.float32)
-    return img, loss
+    return img, loss, out_of_canvas_loss
+    
+def render_parallel(parallel_n, img, grammar, pos, linesize=40, dev_angle=math.pi/4, rand=False, from_data=None, var_len=False):
+    current_pos = pos
+    current_edge = None
+    current_angle = math.pi
+    stack = []
+    loss = 0
+    stored_min_dist = [None]*len(grammar)
+    stored_left_idx = -numpy.ones(len(grammar)).astype('i')
+    linelen_ind = 0
+    out_of_canvas_loss = 0
+    for i in range(len(grammar)):
+        var = grammar[i]
+        if var == '0' or var == '1':
+            if rand:
+                current_linesize = linesize * (1.0 + numpy.random.randn(parallel_n) / 3.0)
+            elif from_data is not None:
+                if rescale:
+                    current_linesize = from_data[i] * linesize
+                else:
+                    current_linesize = from_data[i]
+            else:
+                current_linesize = linesize
+            if use_float32:
+                current_angle = tf.cast(current_angle, tf.float32)
+            else:
+                current_angle = tf.cast(current_angle, tf.float64)
+            if var_len and rand:
+                current_linelen = line_len * (1.0 + numpy.random.randn(parallel_n) / 3.0)
+            elif var_len and from_data is not None:
+                current_linelen = from_data[len(grammar)+linelen_ind]
+                linelen_ind += 1
+                if rescale:
+                    current_linelen *= line_len
+            else:
+                current_linelen = line_len
+            new_pos = polar_to_cart(current_angle, current_linelen, current_pos)
+            out_of_canvas_loss += 1000 * (tf.nn.relu(-new_pos[0]) + tf.nn.relu(-new_pos[1]) + tf.nn.relu(new_pos[0] - size[0]) + tf.nn.relu(new_pos[1] - size[1]))
+            ang1 = current_angle+math.pi/2.0
+            ang2 = current_angle-math.pi/2.0
+            if current_edge is None:
+                p1 = polar_to_cart(ang1, current_linesize/2.0, current_pos)
+                p2 = polar_to_cart(ang2, current_linesize/2.0, current_pos)
+                current_edge = [p1, p2]
+            else:
+                p1 = current_edge[0]
+                p2 = current_edge[1]
+            p3 = polar_to_cart(ang1, current_linesize/2.0, new_pos)
+            p4 = polar_to_cart(ang2, current_linesize/2.0, new_pos)
+            new_edge = [p3, p4]
+            points = [p1, p2, p4, p3, p1]
+            min_dist = get_min_dist_parallel(points, parallel_n)
+            stored_min_dist[i] = min_dist
+            img = draw_from_min_dist_parallel(img, b_color, min_dist)
+            current_pos = new_pos
+            current_edge = new_edge
+        elif var == '[' or var == ']':
+            if rand:
+                if large_angle:
+                    current_dev_angle = dev_angle * (1.0 + numpy.random.rand())
+                else:
+                    current_dev_angle = dev_angle * (1.0 + numpy.random.rand() / 3.0)
+                if test_overlap and (i == 4 or i == 19):
+                    current_dev_angle /= 2.0
+                #current_dev_angle = dev_angle
+            elif from_data is not None:
+                if rescale:
+                    current_dev_angle = from_data[i] * dev_angle
+                else:
+                    current_dev_angle = from_data[i]
+            else:
+                current_dev_angle = dev_angle
+            if var == '[':
+                stack.append((current_pos, current_angle, current_edge, current_linesize, i))
+                current_angle -= current_dev_angle
+                p1 = polar_to_cart(current_angle+math.pi/2.0, current_linesize/2.0, current_pos)
+                p2 = polar_to_cart(current_angle-math.pi/2.0, current_linesize/2.0, current_pos)
+                current_edge = [p1, p2]
+            else:
+                current_pos, current_angle, current_edge, current_linesize, idx = stack.pop()
+                current_angle += current_dev_angle
+                p1 = polar_to_cart(current_angle+math.pi/2.0, current_linesize/2.0, current_pos)
+                p2 = polar_to_cart(current_angle-math.pi/2.0, current_linesize/2.0, current_pos)
+                current_edge = [p1, p2]
+                if loss_type != 'incremental':
+                    left_idx = idx
+                    right_idx = i
+                    for j in range(idx, len(grammar)):
+                        new_var = grammar[j]
+                        if new_var == '0' or new_var == '1':
+                            left_idx = j
+                            break
+                    for j in range(i, len(grammar)):
+                        new_var = grammar[j]
+                        if new_var == '0' or new_var == '1':
+                            right_idx = j
+                            break
+                    stored_left_idx[right_idx] = left_idx
+        else:
+            raise
+    
+    for right_idx in range(len(grammar)):
+        left_idx = stored_left_idx[right_idx]
+        if left_idx >= 0:
+            if loss_type == 'pair':
+                loss += loss_from_min_dist_pair(stored_min_dist[left_idx], stored_min_dist[right_idx])
+            else:
+                parent_idx = left_idx
+                for j in range(left_idx-1, -1, -1):
+                    new_var = grammar[j]
+                    if new_var == '1':
+                        parent_idx = j
+                        break
+                loss += loss_from_min_dist_triple(stored_min_dist[left_idx], stored_min_dist[right_idx], stored_min_dist[parent_idx])
+            
+    if not use_float32:
+        loss = tf.cast(loss, tf.float32)
+    return img, loss, out_of_canvas_loss 
+                
     
 tree = build(iterations, axiom)
+no_branch = 0
+for var in tree:
+    if var == '0' or var == '1':
+        no_branch += 1
 
 def coarse_to_fine_loss(output, ground, nlevels):
     diff = tf.expand_dims(output - ground, axis=0)
@@ -279,6 +457,20 @@ def coarse_to_fine_loss(output, ground, nlevels):
     for n in range(nlevels):
         node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
         loss += tf.reduce_mean(node ** 2.0)
+    return loss
+    
+def coarse_to_fine_loss_parallel(output, ground, nlevels):
+    diff = output - tf.expand_dims(ground.astype('f'), axis=3)
+    loss = tf.reduce_mean(diff ** 2.0, [0, 1, 2])
+    diff = tf.transpose(diff, [2, 0, 1, 3])
+    if not use_float32:
+        loss = tf.cast(loss, tf.float32)
+        node = tf.cast(diff, tf.float32)
+    else:
+        node = diff
+    for n in range(nlevels):
+        node = tf.nn.avg_pool(node, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
+        loss += tf.reduce_mean(node ** 2.0, [0, 1, 2])
     return loss
     
 def coarse_to_fine_loss_list(output, ground, nlevels):
@@ -294,13 +486,13 @@ def coarse_to_fine_loss_list(output, ground, nlevels):
         losses.append(tf.reduce_mean(node ** 2.0))
     return losses[::-1]
     
-def constrain_width_positive(vars):
+def constrain_width_positive(vars, var_size=len(tree)):
     constrain_scale = 100
     loss = 0
-    for i in range(len(tree)):
-        if tree[i] == '1' or tree[i] == '0':
+    for i in range(var_size):
+        if (i < len(tree) and (tree[i] == '1' or tree[i] == '0')) or i >= len(tree):
             #loss -= tf.sign(vars[i])
-            loss += constrain_scale * tf.nn.relu(1e-5-vars[i])
+            loss += constrain_scale * tf.nn.relu(0.1-vars[i])
     if use_float32:
         return loss
     else:
@@ -308,7 +500,7 @@ def constrain_width_positive(vars):
 
 def test1():
     assert loss_type == 'incremental'
-    sess = tf.Session()
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
         tree_width = tf.Variable(tf.random_uniform([], dtype=tf.float32))
@@ -317,10 +509,10 @@ def test1():
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_width = tf.Variable(tf.random_uniform([], dtype=tf.float64))
         tree_angle = tf.Variable(tf.random_uniform([], dtype=tf.float64))
-    ground_img, _ = render(blank_img, tree, startpos)
+    ground_img, _, _ = render(blank_img, tree, startpos)
     ground_arr = sess.run(ground_img)
     skimage.io.imsave('test1_ground.png', ground_arr)
-    output, _ = render(blank_img, tree, startpos, 40.0 * tree_width, tree_angle)
+    output, _, _ = render(blank_img, tree, startpos, 40.0 * tree_width, tree_angle)
     #loss = tf.reduce_mean((output - ground_img) ** 2)
     loss = coarse_to_fine_loss(output, ground_img, 9)
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
@@ -339,17 +531,17 @@ def test1():
 
 def test2():
     assert loss_type == 'incremental'
-    sess = tf.Session()
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float32))
     else:
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
-    ground_img, _ = render(blank_img, tree, startpos, rand=True)
+    ground_img, _, _ = render(blank_img, tree, startpos, rand=True)
     ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
     #skimage.io.imsave('tf_test2_ground.png', ground_arr)
-    output, _ = render(blank_img, tree, startpos, from_data=tree_var)
+    output, _, _ = render(blank_img, tree, startpos, from_data=tree_var)
     loss = coarse_to_fine_loss(output, ground_arr, 9)
     #loss -= 0.0001 * tf.cast(tf.reduce_sum(tree_var), tf.float32)
     constrain = constrain_width_positive(tree_var)
@@ -379,17 +571,17 @@ def test2():
 def test3():
     assert loss_type == 'incremental'
     overlap_scale = 1e-5
-    sess = tf.Session()
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float32))
     else:
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
-    ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
+    ground_img, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, rand=True)
     ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
     skimage.io.imsave('tf_test3_ground.png', ground_arr)
-    output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
+    output, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, from_data=tree_var)
     loss = coarse_to_fine_loss(output, ground_arr, 9)
     constrain = constrain_width_positive(tree_var)
     minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
@@ -424,47 +616,76 @@ def test4(args):
     open(os.path.join(dir_name, 'info.txt'), 'w+').write(str(args))
     nlevels = 9
     overlap_scale = 1e-6
-    sess = tf.Session()
+    if args.change_len:
+        var_size = len(tree) + no_branch
+    else:
+        var_size = len(tree)
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
     if use_float32:
         blank_img = tf.zeros(size+(3,), dtype=tf.float32)
-        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float32))
+        tree_var = tf.Variable(tf.random_uniform([var_size], dtype=tf.float32))
     else:
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
-        tree_var = tf.Variable(tf.random_uniform([len(tree)], dtype=tf.float64))
+        tree_var = tf.Variable(tf.random_uniform([var_size], dtype=tf.float64))
     if args.ground == '':
-        ground_img, overlap_loss = render(blank_img, tree, startpos, rand=True)
+        ground_img, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, rand=True, var_len=args.change_len)
         ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
         skimage.io.imsave(dir_name+'/tf_test4_ground.png', ground_arr)
     else:
-        ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join('train_ground_truth', args.ground)))
-    output, overlap_loss = render(blank_img, tree, startpos, from_data=tree_var)
-    losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
-    constrain = constrain_width_positive(tree_var)
+        ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join(ground_dir, args.ground)))
+    output, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
+    if args.multi_loss:
+        losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
+    else:
+        losses = [coarse_to_fine_loss(output, ground_arr, nlevels)]
+    constrain = constrain_width_positive(tree_var, var_size)
     #if loss_type != 'incremental':
         #constrain += overlap_loss * overlap_scale
-    minimizer = tf.train.AdamOptimizer(learning_rate=0.1)
+    if args.optimizer == 'adam':
+        minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
+    elif args.optimizer == 'gradient':
+        minimizer = tf.train.GradientDescentOptimizer(args.learning_rate)
+    else:
+        raise
     steps = []
     gradients = []
     loss_all = 0
-    lrate = 0.1
+    lrate = args.learning_rate
     previous_loss = None
-    for loss in losses:
-        if seperate_minimizer:
-            lrate *= args.change_lrate
-            new_minimizer = tf.train.AdamOptimizer(learning_rate=lrate)
-        else:
-            new_minimizer = minimizer
-        if previous_loss is not None:
-            current_loss = loss + args.interpolate_loss * previous_loss
-        else:
-            current_loss = loss
-        if loss_type != 'incremental':
-            gradient = new_minimizer.compute_gradients(current_loss + constrain + overlap_loss * overlap_scale)
-        else:
-            gradient = new_minimizer.compute_gradients(current_loss + constrain)
-        gradients.append(gradient)
-        steps.append(new_minimizer.apply_gradients(gradient))
-        loss_all += loss
+    
+    if args.smooth:
+        minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
+        alpha = tf.placeholder(tf.float32, [len(losses)])
+        smooth_loss = 0
+        loss_all = 0
+        for i in range(len(losses)):
+            smooth_loss += alpha[i] * losses[i]
+            loss_all += losses[i]
+        gradient = minimizer.compute_gradients(smooth_loss + constrain + overlap_loss * overlap_scale + out_of_canvas_loss)
+        step = minimizer.apply_gradients(gradient)
+        loss = smooth_loss
+    else:        
+        for loss in losses:
+            if seperate_minimizer:
+                lrate *= args.change_lrate
+                if args.optimizer == 'adam':
+                    new_minimizer = tf.train.AdamOptimizer(learning_rate=lrate, beta1=args.beta1, beta2=args.beta2)
+                elif args.optimizer == 'gradient':
+                    new_minimizer = tf.train.GradientDescentOptimizer(lrate)
+            else:
+                new_minimizer = minimizer
+            if previous_loss is not None:
+                current_loss = loss + args.interpolate_loss * previous_loss
+            else:
+                current_loss = loss
+            if loss_type != 'incremental':
+                gradient = new_minimizer.compute_gradients(current_loss + constrain + overlap_loss * overlap_scale + out_of_canvas_loss)
+            else:
+                gradient = new_minimizer.compute_gradients(current_loss + constrain + out_of_canvas_loss)
+            gradients.append(gradient)
+            steps.append(new_minimizer.apply_gradients(gradient))
+            loss_all += loss
+    
     sess.run(tf.global_variables_initializer())
     init_arr = sess.run(output)
     skimage.io.imsave(dir_name+'/tf_test4_start.png', numpy.clip(init_arr, 0.0, 1.0))
@@ -473,48 +694,121 @@ def test4(args):
     best_var = None
     v_var = None
     iter_i = 1
-    iter_n = len(steps)
+    iter_n = len(losses)
     iter_k = args.iter
-    loss_record = numpy.empty((iter_i, iter_n, iter_k, iter_n+4))
+    current_alpha = numpy.empty(iter_n)
+    if args.smooth:
+        loss_record = numpy.empty((iter_i, 2*iter_n, iter_k, iter_n+6))
+    else:
+        loss_record = numpy.empty((iter_i, iter_n, iter_k, iter_n+5))
     for _ in range(random_restarts):
         for i in range(iter_i):
             print("i,", i)
+            n_ind = 0
             for n in range(iter_n):
                 print("n,", n)
-                #for k in range(iter_k*(n+1)):
-                step = steps[n]
-                loss = losses[n]
-                gradient = gradients[n]
-                for k in range(iter_k):
-                    #_, v_var, v_loss, v_loss_all, v_gradient = sess.run([step, tree_var, loss, loss_all, gradient])
-                    value_all = sess.run([step, tree_var, loss_all, overlap_loss, constrain, gradient] + losses)
-                    v_var = value_all[1]
-                    v_gradient = value_all[5]
-                    numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+'var.npy', v_var)
-                    numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+'gradient.npy', v_gradient)
-                    v_loss_all = value_all[2]
-                    v_overlap_loss = value_all[3]
-                    v_constrain = value_all[4]
-                    v_losses = value_all[6:]
-                    v_loss = v_losses[n]
-                    print(v_loss, v_loss_all)
-                    loss_record[i, n, k, :iter_n] = v_losses
-                    loss_record[i, n, k, iter_n] = v_loss_all
-                    loss_record[i, n, k, iter_n+1] = v_overlap_loss
-                    loss_record[i, n, k, iter_n+2] = v_constrain
-                    loss_record[i, n, k, iter_n+3] = v_loss + v_constrain + v_overlap_loss * overlap_scale
-                    #loss_record[i, n, k, 0] = v_loss
-                    #loss_record[i, n, k, 1] = v_loss_all
-                    if v_loss_all < best_loss:
-                        best_loss = v_loss_all
-                        best_var = v_var
-                        numpy.save(dir_name+'/tf_test4.npy', v_var)
+                if args.smooth:
+                    current_alpha[:] = 0.0
+                    current_alpha[n] = 1.0
+                    modes = ['direct', 'fade']
+                else:
+                    step = steps[n]
+                    loss = losses[n]
+                    gradient = gradients[n]
+                    modes = ['']
+                for mode in modes:
+                    for k in range(iter_k):
+                        if mode == 'fade':
+                            current_alpha[n] = 1.0 - k / iter_k
+                            current_alpha[(n+1)%iter_n] = k / iter_k
+                        #_, v_var, v_loss, v_loss_all, v_gradient = sess.run([step, tree_var, loss, loss_all, gradient])
+                        if args.smooth:
+                            value_all = sess.run([step, tree_var, loss_all, overlap_loss, constrain, gradient, out_of_canvas_loss, smooth_loss] + losses, feed_dict={alpha: current_alpha})
+                        else:
+                            value_all = sess.run([step, tree_var, loss_all, overlap_loss, constrain, gradient, out_of_canvas_loss, loss_all] + losses)
+                        v_var = value_all[1]
+                        v_gradient = value_all[5]
+                        numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+mode+'var.npy', v_var)
+                        numpy.save(dir_name+'/'+str(i)+'_'+str(n)+'_'+str(k)+mode+'gradient.npy', v_gradient)
+                        v_loss_all = value_all[2]
+                        v_overlap_loss = value_all[3]
+                        v_constrain = value_all[4]
+                        v_out_of_canvas = value_all[6]
+                        v_losses = value_all[8:]
+                        if args.smooth:
+                            v_smooth_loss = value_all[7]
+                            print(v_smooth_loss, v_loss_all)
+                            loss_record[i, n_ind, k, iter_n+3] = v_smooth_loss + v_constrain + v_overlap_loss * overlap_scale
+                            loss_record[i, n_ind, k, iter_n+5] = v_smooth_loss
+                        else:
+                            v_loss = v_losses[n]
+                            print(v_loss, v_loss_all)
+                            loss_record[i, n_ind, k, iter_n+3] = v_loss + v_constrain + v_overlap_loss * overlap_scale
+                        loss_record[i, n_ind, k, :iter_n] = v_losses
+                        loss_record[i, n_ind, k, iter_n] = v_loss_all
+                        loss_record[i, n_ind, k, iter_n+1] = v_overlap_loss
+                        loss_record[i, n_ind, k, iter_n+2] = v_constrain
+                        loss_record[i, n_ind, k, iter_n+4] = v_out_of_canvas
+                        #loss_record[i, n, k, 0] = v_loss
+                        #loss_record[i, n, k, 1] = v_loss_all
+                        if v_loss_all < best_loss:
+                            best_loss = v_loss_all
+                            best_var = v_var
+                            numpy.save(dir_name+'/tf_test4.npy', v_var)
+                    n_ind += 1
         sess.run(tf.global_variables_initializer())
     sess.run(tf.assign(tree_var, best_var))
     numpy.save(dir_name+'/tf_test4_loss_record.npy', loss_record)
     best_output = sess.run(output)
     skimage.io.imsave(dir_name+'/tf_test4_output.png', numpy.clip(best_output, 0.0, 1.0))
 
+def test_parallel(args):
+    parallel_n = 2
+    if args.change_len:
+        var_size = len(tree) + no_branch
+    else:
+        var_size = len(tree)
+        
+    ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join(ground_dir, 'regular.png')))
+    
+    #sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+    minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
+    
+    all_loss = []
+    gall = []
+    for i in range(parallel_n):
+        blank_img = tf.zeros(size+(3,), dtype=tf.float32)
+        tree_var = tf.Variable(tf.random_uniform([var_size], dtype=tf.float32))
+        output, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
+        loss = coarse_to_fine_loss(output, ground_arr, 9)
+        all_loss.append(loss)
+        gall.append(minimizer.compute_gradients(loss, var_list=tree_var))
+        
+    #gall = minimizer.compute_gradients(all_loss)
+    sess.run(tf.global_variables_initializer())
+    vgall = sess.run(gall)
+    print(vgall)
+    return
+    
+    blank_img = tf.zeros(size+(3,parallel_n), dtype=tf.float32)
+    tree_var = tf.Variable(tf.random_uniform([var_size, parallel_n], dtype=tf.float32))
+    
+    ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join(ground_dir, 'regular.png')))
+    output, overlap_loss, out_of_canvas_loss = render_parallel(parallel_n, blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
+    
+    loss = coarse_to_fine_loss_parallel(output, ground_arr, 9)
+    constrain = constrain_width_positive(tree_var, var_size)
+    
+    minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
+    
+    g1 = minimizer.compute_gradients(loss[0])
+    gall = minimizer.compute_gradients(tf.reduce_sum(loss))
+    sess.run(tf.global_variables_initializer())
+    vgall, vg1 = sess.run([gall, g1])
+    print(vg1)
+    print(vgall)
+    
 def main():
     parser = argparse_util.ArgumentParser(description='Toy procedural model problem.')
     parser.add_argument('--random-restarts', dest='random_restarts', type=int, default=1, help='number of random restarts')
@@ -535,12 +829,27 @@ def main():
     parser.add_argument('--change-lrate', dest='change_lrate', type=float, default=1.0, help='multiplier used to change learning rate for seperate minimizers')
     parser.add_argument('--interpolate-loss', dest = 'interpolate_loss', type=float, default=0.0, help='interpolate between current level and previous level of loss')
     parser.add_argument('--iter', dest='iter', type=int, default=100, help='number of iter per level of loss')
+    parser.add_argument('--change-len', dest='change_len', action='store_true', help='branch length also variable')
+    parser.add_argument('--fix-len', dest='change_len', action='store_false', help='branch length is fixed')
+    parser.add_argument('--single-loss', dest='multi_loss', action='store_false', help='use the sum of all different level of losses as objective')
+    parser.add_argument('--multi-loss', dest='multi_loss', action='store_true', help='use multiple objectives')
+    parser.add_argument('--optimizer', dest='optimizer', default='adam', help='name of optimizer to use')
+    parser.add_argument('--smooth-transition', dest='smooth', action='store_true', help='smoothly transit between losses')
+    parser.add_argument('--discrete-transition', dest='smooth', action='store_false', help='discretly transit between losses')
+    parser.add_argument('--beta1', dest='beta1', type=float, default=0.9, help='parameter beta1 for adam optimizer')
+    parser.add_argument('--beta2', dest='beta2', type=float, default=0.99, help='parameter beta2 for adam optimizer')
+    parser.add_argument('--learning-rate', dest='learning_rate', type=float, default=0.1, help='parameter learning rate for optimizer')
+    parser.add_argument('--test-parallel', dest='test_parallel', action='store_true', help='test parallel with multiple objectives')
     
     parser.set_defaults(rescale=True)
     parser.set_defaults(use_float32=True)
     parser.set_defaults(test_overlap=False)
     parser.set_defaults(seperate_minimizer=True)
     parser.set_defaults(large_angle=False)
+    parser.set_defaults(change_len=False)
+    parser.set_defaults(multi_loss=True)
+    parser.set_defaults(smooth=False)
+    parser.set_defaults(test_parallel=False)
     
     args = parser.parse_args()
     
@@ -569,7 +878,10 @@ def main():
     if args.prefix == '':
         args.prefix = ''.join(random.choice(string.digits) for _ in range(5))
     #test4(args.prefix, args.ground, args.change_lrate, args.interpolate_loss, str(args))
-    test4(args)
+    if args.test_parallel:
+        test_parallel(args)
+    else:
+        test4(args)
     
 if __name__ == '__main__':
     main()
