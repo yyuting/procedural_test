@@ -439,7 +439,10 @@ def test4(args):
     dir_name = 'var_data' + args.prefix
     if not os.path.exists(dir_name):
         os.mkdir(dir_name)
-    open(os.path.join(dir_name, 'info.txt'), 'w+').write(str(args))
+    if not args.append_random:
+        open(os.path.join(dir_name, 'info.txt'), 'w+').write(str(args))
+    else:
+        open(os.path.join(dir_name, 'info_append.txt'), 'w+').write(str(args))
     nlevels = 9
     overlap_scale = 1e-6
     if args.change_len:
@@ -453,14 +456,16 @@ def test4(args):
     else:
         blank_img = tf.zeros(size+(3,), dtype=tf.float64)
         tree_var = tf.Variable(tf.random_uniform([var_size], dtype=tf.float64))
-    if args.ground == '':
+    if args.append_random:
+        ground_arr = skimage.img_as_float(skimage.io.imread(dir_name+'/tf_test4_ground.png'))
+    elif args.ground == '':
         ground_img, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, rand=True, var_len=args.change_len)
         ground_arr = numpy.clip(sess.run(ground_img), 0.0, 1.0)
         skimage.io.imsave(dir_name+'/tf_test4_ground.png', ground_arr)
     else:
         ground_arr = skimage.img_as_float(skimage.io.imread(os.path.join('train_ground_truth', args.ground)))
     output, overlap_loss, out_of_canvas_loss = render(blank_img, tree, startpos, from_data=tree_var, var_len=args.change_len)
-    if args.multi_loss:
+    if args.multi_loss and (not args.append_random):
         losses = coarse_to_fine_loss_list(output, ground_arr, nlevels)
     else:
         losses = [coarse_to_fine_loss(output, ground_arr, nlevels)]
@@ -479,7 +484,13 @@ def test4(args):
     lrate = args.learning_rate
     previous_loss = None
     
-    if args.smooth:
+    if args.append_random:
+        minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
+        gradient = minimizer.compute_gradients(losses[0] + constrain + overlap_loss * overlap_scale + out_of_canvas_loss)
+        step = minimizer.apply_gradients(gradient)
+        loss = losses[0]
+        loss_all = loss
+    elif args.smooth:
         minimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate, beta1=args.beta1, beta2=args.beta2)
         alpha = tf.placeholder(tf.float32, [len(losses)])
         smooth_loss = 0
@@ -513,8 +524,9 @@ def test4(args):
             loss_all += loss
     
     sess.run(tf.global_variables_initializer())
-    init_arr = sess.run(output)
-    skimage.io.imsave(dir_name+'/tf_test4_start.png', numpy.clip(init_arr, 0.0, 1.0))
+    if not args.append_random:
+        init_arr = sess.run(output)
+        skimage.io.imsave(dir_name+'/tf_test4_start.png', numpy.clip(init_arr, 0.0, 1.0))
     best_loss = 1e8
     best_output = None
     best_var = None
@@ -523,6 +535,44 @@ def test4(args):
     iter_n = len(losses)
     iter_k = args.iter
     current_alpha = numpy.empty(iter_n)
+    
+    if args.append_random:
+        best_var = numpy.load(dir_name + '/tf_test4.npy')
+        sess.run(tf.assign(tree_var, best_var))
+        best_loss = sess.run(loss)
+        loss_record = numpy.empty((random_restarts, iter_k, 5))
+        for r in range(random_restarts):
+            # TODO: get var_size from previous info.txt
+            sess.run(tf.global_variables_initializer())
+            purturbation = args.sigma * numpy.random.randn(var_size)
+            sess.run(tf.assign(tree_var, best_var + purturbation))
+            for k in range(iter_k):
+                value_all = sess.run([step, tree_var, loss, overlap_loss, constrain, gradient, out_of_canvas_loss])
+                v_var = value_all[1]
+                v_gradient = value_all[5]
+                numpy.save(dir_name+'/append'+str(r)+'_'+str(k)+'var.npy', v_var)
+                numpy.save(dir_name+'/append'+str(r)+'_'+str(k)+'gradient.npy', v_gradient)
+                v_loss = value_all[2]
+                v_overlap_loss = value_all[3]
+                v_constrain = value_all[4]
+                v_out_of_canvas = value_all[6]
+                loss_record[r, k, 0] = v_loss
+                loss_record[r, k, 1] = v_overlap_loss
+                loss_record[r, k, 2] = v_constrain
+                loss_record[r, k, 3] = v_loss + v_constrain + v_overlap_loss * overlap_scale + v_out_of_canvas
+                loss_record[r, k, 4] = v_out_of_canvas
+                print(r, k, v_loss)
+                if v_loss < best_loss:
+                    best_loss = v_loss
+                    best_var = v_var
+                    numpy.save(dir_name+'/tf_test4_append.npy', v_var)
+        sess.run(tf.assign(tree_var, best_var))
+        numpy.save(dir_name+'/tf_test4_loss_record_append.npy', loss_record)
+        best_output = sess.run(output)
+        skimage.io.imsave(dir_name+'/tf_test4_output_append.png', numpy.clip(best_output, 0.0, 1.0))
+        return
+    
+    
     if args.smooth:
         loss_record = numpy.empty((iter_i, 2*iter_n, iter_k, iter_n+6))
     else:
@@ -564,12 +614,12 @@ def test4(args):
                         if args.smooth:
                             v_smooth_loss = value_all[7]
                             print(v_smooth_loss, v_loss_all)
-                            loss_record[i, n_ind, k, iter_n+3] = v_smooth_loss + v_constrain + v_overlap_loss * overlap_scale
+                            loss_record[i, n_ind, k, iter_n+3] = v_smooth_loss + v_constrain + v_overlap_loss * overlap_scale + v_out_of_canvas
                             loss_record[i, n_ind, k, iter_n+5] = v_smooth_loss
                         else:
                             v_loss = v_losses[n]
                             print(v_loss, v_loss_all)
-                            loss_record[i, n_ind, k, iter_n+3] = v_loss + v_constrain + v_overlap_loss * overlap_scale
+                            loss_record[i, n_ind, k, iter_n+3] = v_loss + v_constrain + v_overlap_loss * overlap_scale + v_out_of_canvas
                         loss_record[i, n_ind, k, :iter_n] = v_losses
                         loss_record[i, n_ind, k, iter_n] = v_loss_all
                         loss_record[i, n_ind, k, iter_n+1] = v_overlap_loss
@@ -618,6 +668,9 @@ def main():
     parser.add_argument('--beta1', dest='beta1', type=float, default=0.9, help='parameter beta1 for adam optimizer')
     parser.add_argument('--beta2', dest='beta2', type=float, default=0.99, help='parameter beta2 for adam optimizer')
     parser.add_argument('--learning-rate', dest='learning_rate', type=float, default=0.1, help='parameter learning rate for optimizer')
+    parser.add_argument('--append-random', dest='append_random', action='store_true', help='append more iterations on existing optimization that adds randomsness')
+    parser.add_argument('--sigma', dest='sigma', type=float, default=0.1, help='sigma applied to random purturbation')
+    parser.add_argument('--random-gradient', dest='random_gradient', action='store_true', help='add randomness to gradient')
     
     parser.set_defaults(rescale=True)
     parser.set_defaults(use_float32=True)
@@ -627,6 +680,8 @@ def main():
     parser.set_defaults(change_len=False)
     parser.set_defaults(multi_loss=True)
     parser.set_defaults(smooth=False)
+    parser.set_defaults(append_random=False)
+    parser.set_defaults(random_gradient=False)
     
     args = parser.parse_args()
     
